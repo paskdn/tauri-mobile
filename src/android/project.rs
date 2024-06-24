@@ -5,8 +5,8 @@ use super::{
     target::Target,
 };
 use crate::{
-    android::{DEFAULT_ACTIVITY, DEFAULT_THEME_PARENT},
-    bicycle, bossy, dot_cargo,
+    android::{config::DEFAULT_VULKAN_VALIDATION, DEFAULT_ACTIVITY, DEFAULT_THEME_PARENT},
+    bicycle, dot_cargo,
     os::{self, replace_path_separator},
     target::TargetTrait as _,
     templating::{self, Pack},
@@ -27,7 +27,7 @@ pub static ASSET_PACK_TEMPLATE_PACK: &str = "android-studio-asset-pack";
 
 #[derive(Debug)]
 pub enum Error {
-    RustupFailed(bossy::Error),
+    RustupFailed(std::io::Error),
     MissingPack(templating::LookupError),
     TemplateProcessingFailed(bicycle::ProcessingError),
     DirectoryCreationFailed {
@@ -89,6 +89,7 @@ impl Reportable for Error {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn gen(
     config: &Config,
     metadata: &Metadata,
@@ -97,9 +98,12 @@ pub fn gen(
     wrapper: &TextWrapper,
     filter: &templating::Filter,
     dot_cargo: &mut dot_cargo::DotCargo,
+    skip_targets_install: bool,
 ) -> Result<(), Error> {
-    println!("Installing Android toolchains...");
-    Target::install_all().map_err(Error::RustupFailed)?;
+    if !skip_targets_install {
+        println!("Installing Android toolchains...");
+        Target::install_all().map_err(Error::RustupFailed)?;
+    }
     println!("Generating Android Studio project...");
     let src = Pack::lookup_platform(TEMPLATE_PACK)
         .map_err(Error::MissingPack)?
@@ -119,10 +123,16 @@ pub fn gen(
                 )),
             );
             map.insert("root-dir", config.app().root_dir());
-            map.insert("targets", Target::all().values().collect::<Vec<_>>());
-            map.insert("target-names", Target::all().keys().collect::<Vec<_>>());
             map.insert(
-                "arches",
+                "abi-list",
+                Target::all()
+                    .values()
+                    .map(|target| target.abi)
+                    .collect::<Vec<_>>(),
+            );
+            map.insert("target-list", Target::all().keys().collect::<Vec<_>>());
+            map.insert(
+                "arch-list",
                 Target::all()
                     .values()
                     .map(|target| target.arch)
@@ -131,12 +141,15 @@ pub fn gen(
             map.insert("android-app-plugins", metadata.app_plugins());
             map.insert(
                 "android-project-dependencies",
-                metadata.project_dependencies(),
+                metadata.project_dependencies().unwrap_or_default(),
             );
-            map.insert("android-app-dependencies", metadata.app_dependencies());
+            map.insert(
+                "android-app-dependencies",
+                metadata.app_dependencies().unwrap_or_default(),
+            );
             map.insert(
                 "android-app-dependencies-platform",
-                metadata.app_dependencies_platform(),
+                metadata.app_dependencies_platform().unwrap_or_default(),
             );
             map.insert(
                 "has-code",
@@ -146,24 +159,25 @@ pub fn gen(
             );
             map.insert(
                 "android-app-activity-name",
+                metadata.app_activity_name().unwrap_or(DEFAULT_ACTIVITY),
+            );
+            map.insert(
+                "android-vulkan-validation",
                 metadata
-                    .app_activity_name()
-                    .unwrap_or_else(|| DEFAULT_ACTIVITY),
+                    .vulkan_validation()
+                    .unwrap_or(DEFAULT_VULKAN_VALIDATION),
             );
             map.insert("android-app-permissions", metadata.app_permissions());
             map.insert(
                 "android-app-theme-parent",
-                metadata
-                    .app_theme_parent()
-                    .unwrap_or_else(|| DEFAULT_THEME_PARENT),
+                metadata.app_theme_parent().unwrap_or(DEFAULT_THEME_PARENT),
             );
-            map.insert(
-                "asset-packs",
-                asset_packs
-                    .iter()
-                    .map(|p| p.name.as_str())
-                    .collect::<Vec<_>>(),
-            );
+            let asset_packs = asset_packs
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>();
+            map.insert("has-asset-packs", !asset_packs.is_empty());
+            map.insert("asset-packs", asset_packs);
             map.insert("windows", cfg!(windows));
         },
         filter.fun(),
@@ -194,7 +208,7 @@ pub fn gen(
 
     let source_dest = dest.join("app");
     for source in metadata.app_sources() {
-        let source_src = config.app().root_dir().join(&source);
+        let source_src = config.app().root_dir().join(source);
         let source_file = source_src
             .file_name()
             .ok_or_else(|| Error::AssetSourceInvalid(source_src.clone()))?;
@@ -220,7 +234,7 @@ pub fn gen(
             dot_cargo.insert_target(
                 target.triple.to_owned(),
                 target
-                    .generate_cargo_config(config, &env)
+                    .generate_cargo_config(config, env)
                     .map_err(Error::DotCargoGenFailed)?,
             );
         }

@@ -52,16 +52,23 @@ impl FancyPack {
 
         let path = path.as_ref();
         let raw = {
-            let bytes = fs::read(path).map_err(|cause| FancyPackParseError::ReadFailed {
-                path: path.to_owned(),
-                cause,
-            })?;
-            toml::from_slice::<Raw>(&bytes).map_err(|cause| FancyPackParseError::ParseFailed {
+            let toml_str =
+                fs::read_to_string(path).map_err(|cause| FancyPackParseError::ReadFailed {
+                    path: path.to_owned(),
+                    cause,
+                })?;
+            toml::from_str::<Raw>(&toml_str).map_err(|cause| FancyPackParseError::ParseFailed {
                 path: path.to_owned(),
                 cause,
             })?
         };
-        let real_path = util::expand_home(&raw.path).map_err(FancyPackParseError::NoHomeDir)?;
+
+        let raw_path = path
+            .parent()
+            .map(|p| p.join(&raw.path))
+            .unwrap_or(raw.path.clone());
+
+        let real_path = util::expand_home(raw_path).map_err(FancyPackParseError::NoHomeDir)?;
         let this = Self {
             path: real_path,
             base: raw
@@ -70,7 +77,7 @@ impl FancyPack {
                     Pack::lookup(
                         path.parent()
                             .expect("developer error: templates dir had no parent"),
-                        &name,
+                        name,
                     )
                 })
                 .transpose()

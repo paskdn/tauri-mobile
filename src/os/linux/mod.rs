@@ -8,8 +8,8 @@ use std::{
 };
 use thiserror::Error;
 
+use crate::DuctExpressionExt;
 pub use crate::{
-    bossy,
     env::{Env, ExplicitEnv},
     util::ln,
 };
@@ -33,7 +33,7 @@ pub enum DetectEditorError {
 #[derive(Debug, Error)]
 pub enum OpenFileError {
     #[error("Launch failed: {0}")]
-    LaunchFailed(bossy::Error),
+    LaunchFailed(std::io::Error),
     #[error("Command parsing failed")]
     CommandParsingFailed,
 }
@@ -91,7 +91,7 @@ impl Application {
     pub fn open_file(&self, path: impl AsRef<Path>) -> Result<(), OpenFileError> {
         let path = path.as_ref();
 
-        let maybe_icon = self.icon.as_ref().map(|icon_str| icon_str.as_os_str());
+        let maybe_icon = self.icon.as_deref();
 
         // Parse the xdg command field with all the needed data
         let command_parts = xdg::parse_command(
@@ -103,11 +103,9 @@ impl Application {
 
         if !command_parts.is_empty() {
             // If command_parts has at least one element this works. If it has a single
-            // element, &command_parts[1..] should be an empty slice (&[]) and bossy
-            // `with_args` does not add any argument on that case, although the docs
-            // do not make it obvious.
-            bossy::Command::impure(&command_parts[0])
-                .with_args(&command_parts[1..])
+            // element, &command_parts[1..] should be an empty slice (&[]) and duct
+            // does not add any argument on that case
+            duct::cmd(&command_parts[0], &command_parts[1..])
                 .run_and_detach()
                 .map_err(OpenFileError::LaunchFailed)
         } else {
@@ -128,7 +126,7 @@ pub fn open_file_with(
         .iter()
         .find_map(|dir| {
             let dir = dir.join("applications");
-            let (entry, entry_path) = xdg::find_entry_by_app_name(&dir, &app_str)?;
+            let (entry, entry_path) = xdg::find_entry_by_app_name(&dir, app_str)?;
 
             let command_parts = entry
                 .section("Desktop Entry")
@@ -156,9 +154,8 @@ pub fn open_file_with(
         .unwrap_or_else(|| vec![app_str.to_os_string()]);
 
     // If command_parts has at least one element, this won't panic from Out of Bounds
-    bossy::Command::impure(&command_parts[0])
-        .with_args(&command_parts[1..])
-        .with_env_vars(env.explicit_env())
+    duct::cmd(&command_parts[0], &command_parts[1..])
+        .vars(env.explicit_env())
         .run_and_detach()
         .map_err(OpenFileError::LaunchFailed)
 }
@@ -166,21 +163,12 @@ pub fn open_file_with(
 // We use "sh" in order to access "command -v", as that is a bultin command on sh.
 // Linux does not require a binary "command" in path, so this seems the way to go.
 #[cfg(target_os = "linux")]
-pub fn command_path(name: &str) -> bossy::Result<bossy::Output> {
-    bossy::Command::impure("sh")
-        .with_args(&["-c", &format!("command -v {}", name)])
-        .run_and_wait_for_output()
+pub fn command_path(name: &str) -> std::io::Result<std::process::Output> {
+    duct::cmd("sh", ["-c", format!("command -v {name}").as_str()]).run()
 }
 
-pub fn code_command() -> bossy::Command {
-    bossy::Command::impure("code")
-}
-
-pub fn gradlew_command(project_dir: impl AsRef<OsStr>) -> bossy::Command {
-    let gradle_path = Path::new(project_dir.as_ref()).join("gradlew");
-    bossy::Command::impure(&gradle_path)
-        .with_arg("--project-dir")
-        .with_arg(&project_dir)
+pub fn code_command() -> duct::Expression {
+    duct::cmd!("code")
 }
 
 pub fn replace_path_separator(path: OsString) -> OsString {

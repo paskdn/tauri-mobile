@@ -1,10 +1,10 @@
 use crate::{
-    bossy,
     util::{
         self,
         cli::{Report, TextWrapper},
         repo::{self, Repo},
     },
+    DuctExpressionExt,
 };
 use std::{
     fmt::{self, Display},
@@ -25,7 +25,7 @@ pub enum Error {
     StatusFailed(repo::Error),
     MarkerCreateFailed { path: PathBuf, cause: io::Error },
     UpdateFailed(repo::Error),
-    InstallFailed(bossy::Error),
+    InstallFailed(std::io::Error),
     MarkerDeleteFailed { path: PathBuf, cause: io::Error },
 }
 
@@ -34,15 +34,15 @@ impl Display for Error {
         match self {
             Self::NoHomeDir(err) => write!(f, "{}", err),
             Self::StatusFailed(err) => {
-                write!(f, "Failed to check status of `tauri-mobile` repo: {}", err)
+                write!(f, "Failed to check status of `cargo-mobile2` repo: {}", err)
             }
             Self::MarkerCreateFailed { path, cause } => {
                 write!(f, "Failed to create marker file at {:?}: {}", path, cause)
             }
-            Self::UpdateFailed(err) => write!(f, "Failed to update `tauri-mobile` repo: {}", err),
+            Self::UpdateFailed(err) => write!(f, "Failed to update `cargo-mobile2` repo: {}", err),
             Self::InstallFailed(err) => write!(
                 f,
-                "Failed to install new version of `tauri-mobile`: {}",
+                "Failed to install new version of `cargo-mobile2`: {}",
                 err
             ),
             Self::MarkerDeleteFailed { path, cause } => {
@@ -53,7 +53,7 @@ impl Display for Error {
 }
 
 pub(crate) fn cargo_mobile_repo() -> Result<Repo, util::NoHomeDir> {
-    Repo::checkouts_dir("tauri-mobile")
+    Repo::checkouts_dir("cargo-mobile2")
 }
 
 pub(crate) fn updating_marker_path(repo: &Repo) -> PathBuf {
@@ -79,26 +79,28 @@ pub fn update(wrapper: &TextWrapper) -> Result<(), Error> {
             path: marker.to_owned(),
             cause,
         })?;
-        repo.update("https://github.com/tauri-apps/tauri-mobile")
+        repo.update("https://github.com/tauri-apps/cargo-mobile2", "dev")
             .map_err(Error::UpdateFailed)?;
-        println!("Installing updated `tauri-mobile`...");
-        bossy::Command::impure_parse("cargo install --force --path")
-            .with_arg(repo.path())
-            .with_parsed_args("--no-default-features --features")
-            // Using `with_arg` instead of `with_args`/`with_parsed_args` here
-            // is intentional; we want the feature list to be treated as a
-            // single argument.
-            .with_arg(ENABLED_FEATURES.join(" "))
-            .run_and_wait()
+        println!("Installing updated `cargo-mobile2`...");
+        let repo_c = repo.clone();
+        duct::cmd("cargo", ["install", "--force", "--path"])
+            .dup_stdio()
+            .before_spawn(move |cmd| {
+                cmd.arg(repo_c.path());
+                cmd.args(["--no-default-features", "--features"]);
+                cmd.arg(ENABLED_FEATURES.join(" "));
+                Ok(())
+            })
+            .run()
             .map_err(Error::InstallFailed)?;
         fs::remove_file(&marker).map_err(|cause| Error::MarkerDeleteFailed {
             path: marker.to_owned(),
             cause,
         })?;
         log::info!("deleted marker file at {:?}", marker);
-        "installed new version of `tauri-mobile`"
+        "installed new version of `cargo-mobile2`"
     } else {
-        "`tauri-mobile` is already up-to-date"
+        "`cargo-mobile2` is already up-to-date"
     };
     let details = util::unwrap_either(
         repo.latest_subject()

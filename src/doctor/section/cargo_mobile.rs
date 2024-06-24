@@ -17,7 +17,7 @@ fn check_rust() -> Result<String, String> {
         .and_then(|version| {
             version
                 .valid()
-                .then(|| format!("rustc v{}", version.to_string()))
+                .then(|| format!("rustc v{}", version))
                 .ok_or_else(|| {
                     format!(
                         "iOS linking is broken on rustc v{}; please update to 1.49.0 or later",
@@ -42,7 +42,7 @@ pub fn check() -> Result<Section, Unrecoverable> {
                 ))
             } else {
                 Err(format!(
-                    "The tauri-mobile installation directory is missing! Checked at {:?}",
+                    "The cargo-mobile2 installation directory is missing! Checked at {:?}",
                     install_dir,
                 ))
             }),

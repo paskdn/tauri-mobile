@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     fmt::{self, Display},
     path::PathBuf,
+    str::FromStr,
 };
 use thiserror::Error;
 
@@ -87,11 +88,11 @@ impl Platform {
     }
 
     pub fn libraries(&self) -> &[String] {
-        self.libraries.as_deref().unwrap_or_else(|| &[])
+        self.libraries.as_deref().unwrap_or(&[])
     }
 
     pub fn frameworks(&self) -> &[String] {
-        self.frameworks.as_deref().unwrap_or_else(|| &[])
+        self.frameworks.as_deref().unwrap_or(&[])
     }
 
     pub fn valid_archs(&self) -> Option<&[String]> {
@@ -99,11 +100,11 @@ impl Platform {
     }
 
     pub fn vendor_frameworks(&self) -> &[String] {
-        self.vendor_frameworks.as_deref().unwrap_or_else(|| &[])
+        self.vendor_frameworks.as_deref().unwrap_or(&[])
     }
 
     pub fn vendor_sdks(&self) -> &[String] {
-        self.vendor_sdks.as_deref().unwrap_or_else(|| &[])
+        self.vendor_sdks.as_deref().unwrap_or(&[])
     }
 
     pub fn asset_catalogs(&self) -> Option<&[PathBuf]> {
@@ -280,7 +281,7 @@ impl VersionInfo {
 pub struct Config {
     #[serde(skip_serializing)]
     app: App,
-    development_team: String,
+    development_team: Option<String>,
     project_dir: String,
     bundle_version: VersionNumber,
     bundle_version_short: VersionTriple,
@@ -295,7 +296,12 @@ impl Config {
     pub fn from_raw(app: App, raw: Option<Raw>) -> Result<Self, Error> {
         let raw = raw.ok_or_else(|| Error::DevelopmentTeamMissing)?;
 
-        if raw.development_team.is_empty() {
+        if raw
+            .development_team
+            .as_ref()
+            .map(|t| t.is_empty())
+            .unwrap_or_default()
+        {
             return Err(Error::DevelopmentTeamEmpty);
         }
 
@@ -401,22 +407,17 @@ impl Config {
         let path = |tail: &str| self.export_dir().join(format!("{}.ipa", tail));
         let old = path(&self.scheme());
         // It seems like the format changed recently?
-        let new = path(self.app.name());
+        let new = path(self.app.stylized_name());
         std::iter::once(&old)
             .chain(std::iter::once(&new))
-            .filter(|path| {
-                let found = path.is_file();
-                log::info!("IPA {}found at {:?}", if found { "" } else { "not " }, path);
-                found
-            })
-            .next()
+            .find(|path| path.is_file())
             .cloned()
-            .ok_or_else(|| (old, new))
+            .ok_or((old, new))
     }
 
     pub fn app_path(&self) -> PathBuf {
         self.export_dir()
-            .join(format!("Payload/{}.app", self.app.name()))
+            .join(format!("Payload/{}.app", self.app.stylized_name()))
     }
 
     pub fn scheme(&self) -> String {

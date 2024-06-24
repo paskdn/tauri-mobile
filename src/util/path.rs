@@ -3,6 +3,7 @@ use std::{
     fmt::{self, Display},
     io,
     path::{Component, Path, PathBuf},
+    time::SystemTime,
 };
 use thiserror::Error;
 
@@ -43,7 +44,7 @@ pub fn contract_home(path: impl AsRef<Path>) -> Result<String, ContractHomeError
     {
         let home = home_dir()?;
         let home = home.to_str().ok_or(ContractHomeError::HomeInvalidUtf8)?;
-        Ok(path.replace(home, "~").to_owned())
+        Ok(path.replace(home, "~"))
     }
     #[cfg(windows)]
     {
@@ -52,7 +53,10 @@ pub fn contract_home(path: impl AsRef<Path>) -> Result<String, ContractHomeError
 }
 
 pub fn install_dir() -> Result<PathBuf, NoHomeDir> {
-    home_dir().map(|home| home.join(concat!(".", env!("CARGO_PKG_NAME"))))
+    let dir_name = concat!(".", env!("CARGO_PKG_NAME"));
+    std::env::var("CARGO_HOME")
+        .map(|p| PathBuf::from(p).join(dir_name))
+        .or_else(|_| home_dir().map(|home| home.join(".cargo").join(dir_name)))
 }
 
 pub fn checkouts_dir() -> Result<PathBuf, NoHomeDir> {
@@ -61,10 +65,6 @@ pub fn checkouts_dir() -> Result<PathBuf, NoHomeDir> {
 
 pub fn tools_dir() -> Result<PathBuf, NoHomeDir> {
     install_dir().map(|install_dir| install_dir.join("tools"))
-}
-
-pub fn temp_dir() -> PathBuf {
-    std::env::temp_dir().join("com.brainiumstudios.tauri-mobile")
 }
 
 #[derive(Debug)]
@@ -132,10 +132,8 @@ fn common_root(abs_src: &Path, abs_dest: &Path) -> PathBuf {
     loop {
         if abs_src.starts_with(&dest_root) {
             return dest_root;
-        } else {
-            if !dest_root.pop() {
-                unreachable!("`abs_src` and `abs_dest` have no common root");
-            }
+        } else if !dest_root.pop() {
+            unreachable!("`abs_src` and `abs_dest` have no common root");
         }
     }
 }
@@ -219,8 +217,24 @@ pub fn under_root(
     let root = dunce::simplified(root.as_ref());
     normalize_path(root.join(path)).map(|norm| {
         let norm = dunce::simplified(&norm);
-        norm.starts_with(dunce::simplified(root.as_ref()))
+        norm.starts_with(dunce::simplified(root))
     })
+}
+
+pub fn last_modified(first: PathBuf, second: PathBuf) -> PathBuf {
+    let first_modified = first
+        .metadata()
+        .and_then(|m| m.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let second_modified = second
+        .metadata()
+        .and_then(|m| m.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    match first_modified.cmp(&second_modified) {
+        std::cmp::Ordering::Less => second,
+        std::cmp::Ordering::Equal => first,
+        std::cmp::Ordering::Greater => first,
+    }
 }
 
 #[cfg(test)]
@@ -232,30 +246,30 @@ mod test {
         // UNIX
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         case(
-            "/home/user/tauri-mobile-project/gen/android/tauri-mobile-project",
+            "/home/user/cargo-mobile2-project/gen/android/cargo-mobile2-project",
             "app/build/outputs/apk/arm64/debug/app-arm64-debug.apk",
-            "/home/user/tauri-mobile-project/gen/android/tauri-mobile-project/app/build/outputs/apk/arm64/debug/app-arm64-debug.apk"
+            "/home/user/cargo-mobile2-project/gen/android/cargo-mobile2-project/app/build/outputs/apk/arm64/debug/app-arm64-debug.apk"
         ),
         // UNIX but the second path contains root
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         case(
-            "/home/user/tauri-mobile-project/gen/android/tauri-mobile-project",
+            "/home/user/cargo-mobile2-project/gen/android/cargo-mobile2-project",
             "/home/other/project/gen/android/app/build/outputs/apk/arm64/debug/app-arm64-debug.apk",
             "/home/other/project/gen/android/app/build/outputs/apk/arm64/debug/app-arm64-debug.apk"
         ),
         // Windows UNC
         #[cfg(windows)]
         case(
-            "\\\\?\\C:\\Users\\user\\tauri-mobile-project\\gen\\android\\tauri-mobile-project",
+            "\\\\?\\C:\\Users\\user\\cargo-mobile2-project\\gen\\android\\cargo-mobile2-project",
             "app\\..\\app\\build\\outputs\\.\\apk\\arm64\\debug\\app-arm64-debug.apk",
-            "\\\\?\\C:\\Users\\user\\tauri-mobile-project\\gen\\android\\tauri-mobile-project\\app\\build\\outputs\\apk\\arm64\\debug\\app-arm64-debug.apk"
+            "\\\\?\\C:\\Users\\user\\cargo-mobile2-project\\gen\\android\\cargo-mobile2-project\\app\\build\\outputs\\apk\\arm64\\debug\\app-arm64-debug.apk"
         ),
         // Windows legacy
         #[cfg(windows)]
         case (
-            "D:\\Users\\user\\tauri-mobile-project\\gen\\android\\tauri-mobile-project",
+            "D:\\Users\\user\\cargo-mobile2-project\\gen\\android\\cargo-mobile2-project",
             "app\\build\\outputs\\apk\\arm64\\debug\\app-arm64-debug.apk",
-            "D:\\Users\\user\\tauri-mobile-project\\gen\\android\\tauri-mobile-project\\app\\build\\outputs\\apk\\arm64\\debug\\app-arm64-debug.apk"
+            "D:\\Users\\user\\cargo-mobile2-project\\gen\\android\\cargo-mobile2-project\\app\\build\\outputs\\apk\\arm64\\debug\\app-arm64-debug.apk"
         )
     )]
     fn test_prefix_path(root: impl AsRef<Path>, path: impl AsRef<Path>, result: &str) {

@@ -1,10 +1,10 @@
 use crate::{
-    bossy,
     util::{
         self,
         cli::{Report, TextWrapper},
         repo::{self, Repo},
     },
+    DuctExpressionExt,
 };
 use std::{
     fmt::{self, Display},
@@ -15,16 +15,16 @@ use std::{
 #[derive(Debug)]
 pub enum Error {
     NoHomeDir(util::NoHomeDir),
-    XcodeSelectFailed(bossy::Error),
+    XcodeSelectFailed(std::io::Error),
     StatusFailed(repo::Error),
     UpdateFailed(repo::Error),
-    UuidLookupFailed(bossy::Error),
+    UuidLookupFailed(std::io::Error),
     PlistReadFailed { path: PathBuf, cause: io::Error },
     PluginsDirCreationFailed { path: PathBuf, cause: io::Error },
-    PluginCopyFailed(bossy::Error),
+    PluginCopyFailed(std::io::Error),
     SpecDirCreationFailed { path: PathBuf, cause: io::Error },
-    SpecCopyFailed(bossy::Error),
-    MetaCopyFailed(bossy::Error),
+    SpecCopyFailed(std::io::Error),
+    MetaCopyFailed(std::io::Error),
 }
 
 impl Display for Error {
@@ -62,15 +62,13 @@ pub fn xcode_user_dir() -> Result<PathBuf, Error> {
 }
 
 pub fn xcode_developer_dir() -> Result<PathBuf, Error> {
-    use std::os::unix::ffi::OsStrExt as _;
-    bossy::Command::impure("xcode-select")
-        .with_arg("-p")
-        .run_and_wait_for_output()
+    duct::cmd("xcode-select", ["-p"])
+        .stderr_capture()
+        .read()
         .map(|output| {
-            let stdout = output.stdout();
             // This output is expected to end with a newline, but we'll err on
             // the safe side and proceed gracefully if it doesn't.
-            std::ffi::OsStr::from_bytes(stdout.strip_suffix(b"\n").unwrap_or(stdout)).into()
+            PathBuf::from(output.strip_suffix('\n').unwrap_or(&output))
         })
         .map_err(Error::XcodeSelectFailed)
 }
@@ -91,10 +89,7 @@ pub struct InstallationStatus {
 
 impl InstallationStatus {
     pub fn perfect(&self) -> bool {
-        self.plugin_present
-            && self.lang_metadata_present
-            && self.lang_metadata_present
-            && self.repo_fresh
+        self.plugin_present && self.lang_metadata_present && self.repo_fresh
     }
 }
 
@@ -112,7 +107,7 @@ impl UuidStatus {
                 self.uuid, xcode_version.0, xcode_version.1,
             ),
             "You won't be able to set breakpoints in Xcode until this is resolved! Please open an issue at https://github.com/tauri-apps/rust-xcode-plugin",
-        ).print(&wrapper);
+        ).print(wrapper);
     }
 }
 
@@ -190,18 +185,24 @@ impl Context {
     // Step 2: update checkout
     fn update_repo(&self) -> Result<(), Error> {
         self.repo
-            .update("https://github.com/tauri-apps/rust-xcode-plugin.git")
+            .update(
+                "https://github.com/tauri-apps/rust-xcode-plugin.git",
+                "master",
+            )
             .map_err(Error::UpdateFailed)
     }
 
     // Step 3: check if uuid is supported, and prompt user to open issue if not
     pub fn check_uuid(&self) -> Result<UuidStatus, Error> {
         let info_path = self.xcode_app_dir.join("Info");
-        let uuid = bossy::Command::impure("defaults")
-            .with_arg("read")
-            .with_arg(info_path)
-            .with_arg("DVTPlugInCompatibilityUUID")
-            .run_and_wait_for_str(|s| s.trim().to_owned())
+        let uuid = duct::cmd("defaults", ["read"])
+            .before_spawn(move |cmd| {
+                cmd.arg(&info_path).arg("DVTPlugInCompatibilityUUID");
+                Ok(())
+            })
+            .stderr_capture()
+            .read()
+            .map(|s| s.trim().to_owned())
             .map_err(Error::UuidLookupFailed)?;
         let plist_path = self
             .repo
@@ -227,19 +228,27 @@ impl Context {
             })?;
         }
         let checkout = self.repo.path();
-        bossy::Command::impure("cp")
-            .with_arg("-r")
-            .with_arg(checkout.join("Plug-ins/Rust.ideplugin"))
-            .with_arg(&self.xcode_plugins_dir)
-            .run_and_wait()
+        let ide_plugin_path = checkout.join("Plug-ins/Rust.ideplugin");
+        let xcode_plugins_dir = self.xcode_plugins_dir.clone();
+        duct::cmd("cp", ["-r"])
+            .before_spawn(move |cmd| {
+                cmd.arg(&ide_plugin_path).arg(&xcode_plugins_dir);
+                Ok(())
+            })
+            .dup_stdio()
+            .run()
             .map_err(Error::PluginCopyFailed)?;
         let spec_src = checkout.join("Specifications/Rust.xclangspec");
         if self.xcode_version.0 >= 11 {
+            let spec_dst = self.spec_dst.clone();
             println!("`sudo` is required to add new languages to Xcode");
-            bossy::Command::impure("sudo")
-                .with_arg("cp")
-                .with_args(&[&spec_src, &self.spec_dst])
-                .run_and_wait()
+            duct::cmd("sudo", ["cp"])
+                .before_spawn(move |cmd| {
+                    cmd.arg(&spec_src).arg(&spec_dst);
+                    Ok(())
+                })
+                .dup_stdio()
+                .run()
                 .map_err(Error::SpecCopyFailed)?;
         } else {
             if !self.xcode_spec_dir.is_dir() {
@@ -250,24 +259,28 @@ impl Context {
                     }
                 })?;
             }
-            bossy::Command::impure("cp")
-                .with_args(&[&spec_src, &self.spec_dst])
-                .run_and_wait()
+            duct::cmd("cp", [&spec_src, &self.spec_dst])
+                .dup_stdio()
+                .run()
                 .map_err(Error::SpecCopyFailed)?;
         }
         if self.xcode_version.0 >= 11 {
             let meta_src = checkout.join("Xcode.SourceCodeLanguage.Rust.plist");
-            bossy::Command::impure("sudo")
-                .with_arg("cp")
-                .with_args(&[&meta_src, &self.meta_dst])
-                .run_and_wait()
+            let meta_dst = self.meta_dst.clone();
+            duct::cmd("sudo", ["cp"])
+                .before_spawn(move |cmd| {
+                    cmd.arg(&meta_src).arg(&meta_dst);
+                    Ok(())
+                })
+                .dup_stdio()
+                .run()
                 .map_err(Error::MetaCopyFailed)?;
         }
         Report::victory(
             "`rust-xcode-plugin` installed successfully!",
             "Please restart Xcode and click \"Load Bundle\" when an alert shows about `Rust.ideplugin`",
         )
-        .print(&wrapper);
+        .print(wrapper);
         Ok(())
     }
 }

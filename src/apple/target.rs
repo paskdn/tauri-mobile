@@ -4,7 +4,6 @@ use super::{
     version_number::VersionNumber,
 };
 use crate::{
-    bossy,
     env::{Env, ExplicitEnv as _},
     opts::{self, NoiseLevel, Profile},
     target::TargetTrait,
@@ -13,11 +12,12 @@ use crate::{
         cli::{Report, Reportable},
         CargoCommand, WithWorkingDirError,
     },
+    DuctExpressionExt,
 };
 use once_cell_regex::exports::once_cell::sync::OnceCell;
 use std::{
     collections::{BTreeMap, HashMap},
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
 };
 use thiserror::Error;
 
@@ -67,7 +67,7 @@ impl Reportable for VersionCheckError {
 #[derive(Debug)]
 pub enum CheckError {
     VersionCheckFailed(VersionCheckError),
-    CargoCheckFailed(bossy::Error),
+    CargoCheckFailed(std::io::Error),
 }
 
 impl Reportable for CheckError {
@@ -84,7 +84,7 @@ pub enum CompileLibError {
     #[error(transparent)]
     VersionCheckFailed(VersionCheckError),
     #[error("Failed to run `cargo build`: {0}")]
-    CargoBuildFailed(bossy::Error),
+    CargoBuildFailed(std::io::Error),
 }
 
 impl Reportable for CompileLibError {
@@ -98,7 +98,7 @@ impl Reportable for CompileLibError {
 
 #[derive(Debug, Error)]
 #[error(transparent)]
-pub struct BuildError(bossy::Error);
+pub struct BuildError(#[from] std::io::Error);
 
 impl Reportable for BuildError {
     fn report(&self) -> Report {
@@ -109,9 +109,9 @@ impl Reportable for BuildError {
 #[derive(Debug, Error)]
 pub enum ArchiveError {
     #[error("Failed to set app version number: {0}")]
-    SetVersionFailed(WithWorkingDirError<bossy::Error>),
+    SetVersionFailed(WithWorkingDirError<std::io::Error>),
     #[error("Failed to archive via `xcodebuild`: {0}")]
-    ArchiveFailed(bossy::Error),
+    ArchiveFailed(#[from] std::io::Error),
 }
 
 impl Reportable for ArchiveError {
@@ -125,7 +125,7 @@ impl Reportable for ArchiveError {
 
 #[derive(Debug, Error)]
 #[error(transparent)]
-pub struct ExportError(bossy::Error);
+pub struct ExportError(#[from] std::io::Error);
 
 impl Reportable for ExportError {
     fn report(&self) -> Report {
@@ -186,6 +186,10 @@ impl<'a> TargetTrait<'a> for Target<'a> {
             );
             targets
         })
+    }
+
+    fn name_list() -> Vec<&'a str> {
+        Self::all().keys().copied().collect::<Vec<_>>()
     }
 
     fn triple(&'a self) -> &'a str {
@@ -252,7 +256,7 @@ impl<'a> Target<'a> {
             CargoCommand::new(subcommand)
                 .with_package(Some(config.app().name()))
                 .with_manifest_path(Some(config.app().manifest_path()))
-                .with_target(Some(&self.triple))
+                .with_target(Some(self.triple))
                 .with_no_default_features(metadata.no_default_features())
                 .with_args(metadata.cargo_args())
                 .with_features(metadata.features())
@@ -269,8 +273,8 @@ impl<'a> Target<'a> {
         self.cargo(config, metadata, "check")
             .map_err(CheckError::VersionCheckFailed)?
             .with_verbose(noise_level.pedantic())
-            .into_command_pure(env)
-            .run_and_wait()
+            .build(env)
+            .run()
             .map_err(CheckError::CargoCheckFailed)?;
         Ok(())
     }
@@ -278,6 +282,7 @@ impl<'a> Target<'a> {
     // NOTE: it's up to Xcode to pass the verbose flag here, so even when
     // using our build/run commands it won't get passed.
     // TODO: do something about that?
+    #[allow(clippy::too_many_arguments)]
     pub fn compile_lib(
         &self,
         config: &Config,
@@ -294,10 +299,13 @@ impl<'a> Target<'a> {
             .map_err(CompileLibError::VersionCheckFailed)?
             .with_verbose(noise_level.pedantic())
             .with_release(profile.release())
-            .into_command_pure(env)
-            .with_env_vars(cc_env)
-            .with_args(&["--color", color])
-            .run_and_wait()
+            .build(env)
+            .before_spawn(move |cmd| {
+                cmd.args(["--color", color]);
+                Ok(())
+            })
+            .vars(cc_env)
+            .run()
             .map_err(CompileLibError::CargoBuildFailed)?;
         Ok(())
     }
@@ -310,20 +318,31 @@ impl<'a> Target<'a> {
         profile: opts::Profile,
     ) -> Result<(), BuildError> {
         let configuration = profile.as_str();
-        bossy::Command::pure("xcodebuild")
-            .with_env_vars(env.explicit_env())
-            .with_env_var("FORCE_COLOR", "--force-color")
-            .with_args(verbosity(noise_level))
-            .with_args(&["-scheme", &config.scheme()])
-            .with_arg("-workspace")
-            .with_arg(&config.workspace_path())
-            .with_args(&["-sdk", self.sdk])
-            .with_args(&["-configuration", configuration])
-            .with_args(&["-arch", self.arch])
-            .with_arg("-allowProvisioningUpdates")
-            .with_arg("build")
-            .run_and_wait()
-            .map_err(BuildError)?;
+        let scheme = config.scheme();
+        let workspace_path = config.workspace_path();
+        let sdk = self.sdk.to_string();
+        let arch = self.arch.to_string();
+        let args: Vec<OsString> = vec![];
+        duct::cmd("xcodebuild", args)
+            .full_env(env.explicit_env())
+            .env("FORCE_COLOR", "--force-color")
+            .before_spawn(move |cmd| {
+                if let Some(v) = verbosity(noise_level) {
+                    cmd.arg(v);
+                }
+                cmd.args(["-scheme", &scheme])
+                    .arg("-workspace")
+                    .arg(&workspace_path)
+                    .args(["-sdk", &sdk])
+                    .args(["-configuration", configuration])
+                    .args(["-arch", &arch])
+                    .arg("-allowProvisioningUpdates")
+                    .arg("build");
+                Ok(())
+            })
+            .dup_stdio()
+            .start()?
+            .wait()?;
         Ok(())
     }
 
@@ -337,29 +356,45 @@ impl<'a> Target<'a> {
     ) -> Result<(), ArchiveError> {
         if let Some(build_number) = build_number {
             util::with_working_dir(config.project_dir(), || {
-                bossy::Command::pure_parse("xcrun agvtool new-version -all")
-                    .with_arg(&build_number.to_string())
-                    .run_and_wait()
+                duct::cmd(
+                    "xcrun",
+                    ["agvtool", "new-version", "-all", &build_number.to_string()],
+                )
+                .dup_stdio()
+                .run()
             })
             .map_err(ArchiveError::SetVersionFailed)?;
         }
+
         let configuration = profile.as_str();
-        let archive_path = config.archive_dir().join(&config.scheme());
-        bossy::Command::pure("xcodebuild")
-            .with_env_vars(env.explicit_env())
-            .with_args(verbosity(noise_level))
-            .with_args(&["-scheme", &config.scheme()])
-            .with_arg("-workspace")
-            .with_arg(&config.workspace_path())
-            .with_args(&["-sdk", self.sdk])
-            .with_args(&["-configuration", configuration])
-            .with_args(&["-arch", self.arch])
-            .with_arg("-allowProvisioningUpdates")
-            .with_arg("archive")
-            .with_arg("-archivePath")
-            .with_arg(&archive_path)
-            .run_and_wait()
-            .map_err(ArchiveError::ArchiveFailed)?;
+        let archive_path = config.archive_dir().join(config.scheme());
+        let scheme = config.scheme();
+        let workspace_path = config.workspace_path();
+        let sdk = self.sdk.to_string();
+        let arch = self.arch.to_string();
+        let args: Vec<OsString> = vec![];
+        duct::cmd("xcodebuild", args)
+            .full_env(env.explicit_env())
+            .before_spawn(move |cmd| {
+                if let Some(v) = verbosity(noise_level) {
+                    cmd.arg(v);
+                }
+                cmd.args(["-scheme", &scheme])
+                    .arg("-workspace")
+                    .arg(&workspace_path)
+                    .args(["-sdk", &sdk])
+                    .args(["-configuration", configuration])
+                    .args(["-arch", &arch])
+                    .arg("-allowProvisioningUpdates")
+                    .arg("archive")
+                    .arg("-archivePath")
+                    .arg(&archive_path);
+                Ok(())
+            })
+            .dup_stdio()
+            .start()?
+            .wait()?;
+
         Ok(())
     }
 
@@ -372,19 +407,30 @@ impl<'a> Target<'a> {
         // Super fun discrepancy in expectation of `-archivePath` value
         let archive_path = config
             .archive_dir()
-            .join(&format!("{}.xcarchive", config.scheme()));
-        bossy::Command::pure("xcodebuild")
-            .with_env_vars(env.explicit_env())
-            .with_args(verbosity(noise_level))
-            .with_arg("-exportArchive")
-            .with_arg("-archivePath")
-            .with_arg(&archive_path)
-            .with_arg("-exportOptionsPlist")
-            .with_arg(&config.export_plist_path())
-            .with_arg("-exportPath")
-            .with_arg(&config.export_dir())
-            .run_and_wait()
-            .map_err(ExportError)?;
+            .join(format!("{}.xcarchive", config.scheme()));
+        let export_dir = config.export_dir();
+        let export_plist_path = config.export_plist_path();
+
+        let args: Vec<OsString> = vec![];
+        duct::cmd("xcodebuild", args)
+            .full_env(env.explicit_env())
+            .before_spawn(move |cmd| {
+                if let Some(v) = verbosity(noise_level) {
+                    cmd.arg(v);
+                }
+                cmd.arg("-exportArchive")
+                    .arg("-archivePath")
+                    .arg(&archive_path)
+                    .arg("-exportOptionsPlist")
+                    .arg(&export_plist_path)
+                    .arg("-exportPath")
+                    .arg(&export_dir);
+                Ok(())
+            })
+            .dup_stdio()
+            .start()?
+            .wait()?;
+
         Ok(())
     }
 }

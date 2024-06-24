@@ -2,7 +2,6 @@ use crate::android;
 #[cfg(target_os = "macos")]
 use crate::apple;
 use crate::{
-    bossy,
     config::{
         self,
         metadata::{self, Metadata},
@@ -51,8 +50,8 @@ pub enum Error {
         asset_dir: PathBuf,
         cause: io::Error,
     },
-    CodeCommandPresentFailed(bossy::Error),
-    LldbExtensionInstallFailed(bossy::Error),
+    CodeCommandPresentFailed(std::io::Error),
+    LldbExtensionInstallFailed(std::io::Error),
     DotCargoLoadFailed(dot_cargo::LoadError),
     HostTargetTripleDetectionFailed(util::HostTargetTripleError),
     MetadataFailed(metadata::Error),
@@ -92,15 +91,17 @@ impl Reportable for Error {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn exec(
     wrapper: &TextWrapper,
     non_interactive: bool,
     skip_dev_tools: bool,
+    skip_targets_install: bool,
     #[cfg_attr(not(target_os = "macos"), allow(unused))] reinstall_deps: bool,
     open_in_editor: bool,
     submodule_commit: Option<String>,
     cwd: impl AsRef<Path>,
-) -> Result<Config, Error> {
+) -> Result<Config, Box<Error>> {
     let cwd = cwd.as_ref();
     let (config, config_origin) =
         Config::load_or_gen(cwd, non_interactive, wrapper).map_err(Error::ConfigLoadOrGenFailed)?;
@@ -135,12 +136,15 @@ pub fn exec(
             .map_err(|cause| Error::AssetDirCreationFailed { asset_dir, cause })?;
     }
     if !skip_dev_tools && util::command_present("code").map_err(Error::CodeCommandPresentFailed)? {
-        let mut command = code_command().with_args(&["--install-extension", "vadimcn.vscode-lldb"]);
-        if non_interactive {
-            command.add_arg("--force");
-        }
-        command
-            .run_and_wait()
+        code_command()
+            .before_spawn(move |cmd| {
+                cmd.args(["--install-extension", "vadimcn.vscode-lldb"]);
+                if non_interactive {
+                    cmd.arg("--force");
+                }
+                Ok(())
+            })
+            .run()
             .map_err(Error::LldbExtensionInstallFailed)?;
     }
     let mut dot_cargo =
@@ -159,7 +163,7 @@ pub fn exec(
         util::host_target_triple().map_err(Error::HostTargetTripleDetectionFailed)?,
     );
 
-    let metadata = Metadata::load(&config.app().root_dir()).map_err(Error::MetadataFailed)?;
+    let metadata = Metadata::load(config.app().root_dir()).map_err(Error::MetadataFailed)?;
 
     // Generate Xcode project
     #[cfg(target_os = "macos")]
@@ -174,6 +178,7 @@ pub fn exec(
             skip_dev_tools,
             reinstall_deps,
             &filter,
+            skip_targets_install,
         )
         .map_err(Error::AppleInitFailed)?;
     } else {
@@ -191,6 +196,7 @@ pub fn exec(
                 wrapper,
                 &filter,
                 &mut dot_cargo,
+                skip_targets_install,
             )
             .map_err(Error::AndroidInitFailed)?,
             Err(err) => {

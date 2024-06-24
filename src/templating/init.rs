@@ -1,11 +1,12 @@
+use handlebars::RenderErrorReason;
+
 use crate::{
     bicycle::{
-        handlebars::{
-            self, Context, Handlebars, Helper, HelperResult, Output, RenderContext, RenderError,
-        },
+        handlebars::{self, Context, Handlebars, Helper, HelperResult, Output, RenderContext},
         Bicycle, EscapeFn, HelperDef, JsonMap,
     },
     config::{app, Config},
+    reserved_names::KOTLIN_ONLY_KEYWORDS,
     util::{self, Git},
 };
 use std::collections::HashMap;
@@ -14,19 +15,14 @@ fn get_str<'a>(helper: &'a Helper) -> &'a str {
     helper
         .param(0)
         .and_then(|v| v.value().as_str())
-        .unwrap_or_else(|| "")
+        .unwrap_or("")
 }
 
-fn get_str_array<'a>(
-    helper: &'a Helper,
-    formatter: impl Fn(&str) -> String,
-) -> Option<Vec<String>> {
+fn get_str_array(helper: &Helper, formatter: impl Fn(&str) -> String) -> Option<Vec<String>> {
     helper.param(0).and_then(|v| {
-        v.value().as_array().and_then(|arr| {
-            arr.iter()
-                .map(|val| val.as_str().map(|s| formatter(s)))
-                .collect()
-        })
+        v.value()
+            .as_array()
+            .and_then(|arr| arr.iter().map(|val| val.as_str().map(&formatter)).collect())
     })
 }
 
@@ -49,8 +45,8 @@ fn join(
     out: &mut dyn Output,
 ) -> HelperResult {
     out.write(
-        &get_str_array(helper, |s| format!("{}", s))
-            .ok_or_else(|| RenderError::new("`join` helper wasn't given an array"))?
+        &get_str_array(helper, |s| s.to_string())
+            .ok_or_else(|| RenderErrorReason::Other("`join` helper wasn't given an array".into()))?
             .join(", "),
     )
     .map_err(Into::into)
@@ -65,7 +61,9 @@ fn quote_and_join(
 ) -> HelperResult {
     out.write(
         &get_str_array(helper, |s| format!("{:?}", s))
-            .ok_or_else(|| RenderError::new("`quote-and-join` helper wasn't given an array"))?
+            .ok_or_else(|| {
+                RenderErrorReason::Other("`quote-and-join` helper wasn't given an array".into())
+            })?
             .join(", "),
     )
     .map_err(Into::into)
@@ -81,7 +79,9 @@ fn quote_and_join_colon_prefix(
     out.write(
         &get_str_array(helper, |s| format!("{:?}", format!(":{}", s)))
             .ok_or_else(|| {
-                RenderError::new("`quote-and-join-colon-prefix` helper wasn't given an array")
+                RenderErrorReason::Other(
+                    "`quote-and-join-colon-prefix` helper wasn't given an array".into(),
+                )
             })?
             .join(", "),
     )
@@ -123,16 +123,40 @@ fn reverse_domain_snake_case(
         .map_err(Into::into)
 }
 
-fn app_root<'a>(ctx: &'a Context) -> Result<&'a str, RenderError> {
+fn escape_kotlin_keyword(
+    helper: &Helper,
+    _: &Handlebars,
+    _: &Context,
+    _: &mut RenderContext,
+    out: &mut dyn Output,
+) -> HelperResult {
+    let escaped_result = get_str(helper)
+        .split('.')
+        .map(|s| {
+            if KOTLIN_ONLY_KEYWORDS.contains(&s) {
+                format!("`{}`", s)
+            } else {
+                s.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".");
+
+    out.write(&escaped_result).map_err(Into::into)
+}
+
+fn app_root(ctx: &Context) -> Result<&str, RenderErrorReason> {
     let app_root = ctx
         .data()
         .get(app::KEY)
-        .ok_or_else(|| RenderError::new("`app` missing from template data."))?
+        .ok_or_else(|| RenderErrorReason::Other("`app` missing from template data.".into()))?
         .get("root-dir")
-        .ok_or_else(|| RenderError::new("`app.root-dir` missing from template data."))?;
-    app_root
-        .as_str()
-        .ok_or_else(|| RenderError::new("`app.root-dir` contained invalid UTF-8."))
+        .ok_or_else(|| {
+            RenderErrorReason::Other("`app.root-dir` missing from template data.".into())
+        })?;
+    app_root.as_str().ok_or_else(|| {
+        RenderErrorReason::Other("`app.root-dir` contained invalid UTF-8..into()".into())
+    })
 }
 
 fn prefix_path(
@@ -146,8 +170,9 @@ fn prefix_path(
         util::prefix_path(app_root(ctx)?, get_str(helper))
             .to_str()
             .ok_or_else(|| {
-                RenderError::new(
-                    "Either the `app.root-dir` or the specified path contained invalid UTF-8.",
+                RenderErrorReason::Other(
+                    "Either the `app.root-dir` or the specified path contained invalid UTF-8."
+                        .into(),
                 )
             })?,
     )
@@ -164,12 +189,15 @@ fn unprefix_path(
     out.write(
         util::unprefix_path(app_root(ctx)?, get_str(helper))
             .map_err(|_| {
-                RenderError::new("Attempted to unprefix a path that wasn't in the app root dir.")
+                RenderErrorReason::Other(
+                    "Attempted to unprefix a path that wasn't in the app root dir.".into(),
+                )
             })?
             .to_str()
             .ok_or_else(|| {
-                RenderError::new(
-                    "Either the `app.root-dir` or the specified path contained invalid UTF-8.",
+                RenderErrorReason::Other(
+                    "Either the `app.root-dir` or the specified path contained invalid UTF-8."
+                        .into(),
                 )
             })?,
     )
@@ -183,18 +211,16 @@ fn dot_to_slash(
     _: &mut RenderContext,
     out: &mut dyn Output,
 ) -> HelperResult {
-    out.write(&get_str(helper).replace(".", "/"))
+    out.write(&get_str(helper).replace('.', "/"))
         .map_err(Into::into)
 }
 
 fn detect_author() -> String {
     let git = Git::new(".".as_ref());
     let name_output = git.user_name().ok();
-    let name = name_output.as_deref().unwrap_or_else(|| "Watashi");
+    let name = name_output.as_deref().unwrap_or("Watashi");
     let email_output = git.user_email().ok();
-    let email = email_output
-        .as_deref()
-        .unwrap_or_else(|| "watashi@example.com");
+    let email = email_output.as_deref().unwrap_or("watashi@example.com");
     format!("{} <{}>", name.trim(), email.trim())
 }
 
@@ -216,6 +242,7 @@ pub fn init(config: Option<&Config>) -> Bicycle {
                 "reverse-domain-snake-case",
                 Box::new(reverse_domain_snake_case),
             );
+            helpers.insert("escape-kotlin-keyword", Box::new(escape_kotlin_keyword));
             helpers.insert("dot-to-slash", Box::new(dot_to_slash));
             if config.is_some() {
                 // don't mix these up or very bad things will happen to all of us

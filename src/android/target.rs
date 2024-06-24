@@ -5,7 +5,6 @@ use super::{
     ndk,
 };
 use crate::{
-    bossy,
     dot_cargo::DotCargoTarget,
     opts::{NoiseLevel, Profile},
     target::TargetTrait,
@@ -16,7 +15,7 @@ use crate::{
 };
 use once_cell_regex::exports::once_cell::sync::OnceCell;
 use serde::Serialize;
-use std::{collections::BTreeMap, fmt, fs, io, path::PathBuf, str};
+use std::{collections::BTreeMap, fmt, io, path::PathBuf, str};
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug)]
@@ -50,7 +49,7 @@ pub enum CompileLibError {
     #[error("`Failed to run `cargo {mode}`: {cause}")]
     CargoFailed {
         mode: CargoMode,
-        cause: bossy::Error,
+        cause: std::io::Error,
     },
     #[error("`Failed to write file at {path} : {cause}")]
     FileWrite { path: PathBuf, cause: io::Error },
@@ -159,6 +158,10 @@ impl<'a> TargetTrait<'a> for Target<'a> {
         })
     }
 
+    fn name_list() -> Vec<&'a str> {
+        Self::all().keys().copied().collect::<Vec<_>>()
+    }
+
     fn triple(&'a self) -> &'a str {
         self.triple
     }
@@ -170,11 +173,11 @@ impl<'a> TargetTrait<'a> for Target<'a> {
 
 impl<'a> Target<'a> {
     fn clang_triple(&self) -> &'a str {
-        self.clang_triple_override.unwrap_or_else(|| self.triple)
+        self.clang_triple_override.unwrap_or(self.triple)
     }
 
     fn binutils_triple(&self) -> &'a str {
-        self.binutils_triple_override.unwrap_or_else(|| self.triple)
+        self.binutils_triple_override.unwrap_or(self.triple)
     }
 
     pub fn for_abi(abi: &str) -> Option<&'a Self> {
@@ -210,9 +213,10 @@ impl<'a> Target<'a> {
             linker: Some(linker),
             rustflags: vec![
                 "-L".to_owned(),
-                dunce::simplified(&config.app().prefix_path(".cargo"))
-                    .display()
-                    .to_string(),
+                format!(
+                    "\"{}\"",
+                    dunce::simplified(&config.app().prefix_path(".cargo")).display()
+                ),
                 "-Clink-arg=-landroid".to_owned(),
                 "-Clink-arg=-llog".to_owned(),
                 "-Clink-arg=-lOpenSLES".to_owned(),
@@ -220,6 +224,7 @@ impl<'a> Target<'a> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn compile_lib(
         &self,
         config: &Config,
@@ -231,16 +236,6 @@ impl<'a> Target<'a> {
         mode: CargoMode,
     ) -> Result<(), CompileLibError> {
         let min_sdk_version = config.min_sdk_version();
-
-        // workaround for missing libgcc in ndk versions higher then 23
-        // see https://github.com/rust-windowing/android-ndk-rs/pull/189
-        if env.ndk.version().unwrap_or_default().triple.major >= 23 {
-            let path = config.app().prefix_path(".cargo/libgcc.a");
-            if !path.exists() {
-                fs::write(&path, "INPUT(-lunwind)")
-                    .map_err(|cause| CompileLibError::FileWrite { path, cause })?;
-            }
-        }
 
         // Force color, since gradle would otherwise give us uncolored output
         // (which Android Studio makes red, which is extra gross!)
@@ -254,28 +249,31 @@ impl<'a> Target<'a> {
             .with_args(metadata.cargo_args())
             .with_features(metadata.features())
             .with_release(profile.release())
-            .into_command_pure(env)
-            .with_env_var("ANDROID_NATIVE_API_LEVEL", min_sdk_version.to_string())
-            .with_env_var(
+            .build(env)
+            .env("ANDROID_NATIVE_API_LEVEL", min_sdk_version.to_string())
+            .env(
                 "TARGET_AR",
                 env.ndk
                     .ar_path(self.triple)
                     .map_err(CompileLibError::MissingTool)?,
             )
-            .with_env_var(
+            .env(
                 "TARGET_CC",
                 env.ndk
                     .compiler_path(ndk::Compiler::Clang, self.clang_triple(), min_sdk_version)
                     .map_err(CompileLibError::MissingTool)?,
             )
-            .with_env_var(
+            .env(
                 "TARGET_CXX",
                 env.ndk
                     .compiler_path(ndk::Compiler::Clangxx, self.clang_triple(), min_sdk_version)
                     .map_err(CompileLibError::MissingTool)?,
             )
-            .with_args(&["--color", color])
-            .run_and_wait()
+            .before_spawn(move |cmd| {
+                cmd.args(["--color", color]);
+                Ok(())
+            })
+            .run()
             .map_err(|cause| CompileLibError::CargoFailed { mode, cause })?;
         Ok(())
     }
@@ -310,7 +308,7 @@ impl<'a> Target<'a> {
 
         let src = config
             .app()
-            .target_dir(&self.triple, profile)
+            .target_dir(self.triple, profile)
             .join(config.so_name());
 
         if !src.exists() {

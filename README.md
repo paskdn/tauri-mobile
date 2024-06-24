@@ -1,30 +1,22 @@
-# tauri-mobile
+# cargo-mobile2
 
-> This project is a fork of [cargo-mobile](https://github.com/BrainiumLLC/cargo-mobile/). Tauri uses it as a library dependency instead of using its CLI directly. For more information, please visit [Tauri's mobile guide](https://next--tauri.netlify.app/next/mobile/).
+> _The answer to "how do I use Rust on iOS and Android?"_
 >
-> But tauri-mobile does contain the template of wry, please follow [wry's instruction](https://github.com/tauri-apps/wry#android--ios) if you want to use with it.
+> cargo-mobile takes care of generating Xcode and Android Studio project files, building and running on device, generating project boilerplate, and a few other things!
 
-*The answer to "how do I use Rust on iOS and Android?"*
+This project is a fork of [cargo-mobile](https://github.com/BrainiumLLC/cargo-mobile/). Tauri uses it as a library dependency instead of using its CLI directly. For more information, please visit [Tauri's mobile guide](https://next--tauri.netlify.app/next/mobile/).
 
-tauri-mobile takes care of generating Xcode and Android Studio project files, building and running on device, generating project boilerplate, and a few other things!
-
-## Status
-
-Everything here works and is already used internally! However, this hasn't seen a lot of external use yet, so there could still be some rough edges.
-
-**Building for iOS is broken on Rust 1.46.0, 1.47.0, and 1.48.0!**
-
-Sorry for the inconvenience! This is resolved in Rust 1.49.0, so please use 1.49 or higher.
+In the meantime, cargo-mobile2 contains the template of wry, please follow [wry's instruction](https://github.com/tauri-apps/wry#android--ios) if you want to use with it.
 
 ## Installation
 
 The build will probably take a bit, so feel free to go get a snack or something.
 
 ```bash
-cargo install --git https://github.com/tauri-apps/tauri-mobile
+cargo install --git https://github.com/tauri-apps/cargo-mobile2
 ```
 
-tauri-mobile is currently supported on macOS, Linux and Windows. Note that it's not possible to target iOS on platforms other than macOS! You'll still get to target Android either way.
+cargo-mobile2 is currently supported on macOS, Linux and Windows. Note that it's not possible to target iOS on platforms other than macOS! You'll still get to target Android either way.
 
 You'll need to have Xcode and the Android SDK/NDK installed. Some of this will ideally be automated in the future, or at least we'll provide a helpful guide and diagnostics.
 
@@ -44,11 +36,16 @@ cargo mobile init
 
 After some straightforward prompts, you'll be asked to select a template pack. Template packs are used to generate project boilerplate, i.e. using the `wry` template pack gives you a [wry](https://github.com/tauri-apps/wry) project that runs out-of-the-box on desktop and mobile.
 
-| name      | info                                  |
-| --------- | ------------------------------------- |
-| wry       | Minimal wry project |
+| name | info                                                                                                                |
+| ---- | ------------------------------------------------------------------------------------------------------------------- |
+| wry  | Minimal wry project                                                                                                 |
+| egui | Full egui + winit + wgpu example based on [agdk-egui example](https://github.com/rust-mobile/rust-android-examples) |
 
-**Template pack contribution is welcomed**;
+**Template pack contribution is welcomed**
+
+> **Note**
+>
+> For all the templates available now, currently `bevy` templates do not work and will encounter compile error if you try to build the project.
 
 Once you've generated your project, you can run `cargo run` as usual to run your app on desktop. However, now you can also do `cargo apple run` and `cargo android run` to run on connected iOS and Android devices respectively!
 

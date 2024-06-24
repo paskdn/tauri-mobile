@@ -1,9 +1,7 @@
 #![cfg(feature = "cli")]
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
-use structopt::StructOpt;
-use tauri_mobile::{
+use cargo_mobile2::{
     doctor, init, update,
     util::{
         self,
@@ -13,6 +11,8 @@ use tauri_mobile::{
     },
     NAME,
 };
+use std::path::PathBuf;
+use structopt::StructOpt;
 
 #[derive(Debug, StructOpt)]
 #[structopt(
@@ -39,6 +39,8 @@ pub enum Command {
         #[structopt(flatten)]
         skip_dev_tools: cli::SkipDevTools,
         #[structopt(flatten)]
+        skip_targets_install: cli::SkipTargetsInstall,
+        #[structopt(flatten)]
         reinstall_deps: cli::ReinstallDeps,
         #[structopt(long = "open", help = "Open in default code editor")]
         open_in_editor: bool,
@@ -49,6 +51,8 @@ pub enum Command {
     New {
         #[structopt(flatten)]
         skip_dev_tools: cli::SkipDevTools,
+        #[structopt(flatten)]
+        skip_targets_install: cli::SkipTargetsInstall,
         #[structopt(flatten)]
         reinstall_deps: cli::ReinstallDeps,
         #[structopt(long = "open", help = "Open in default code editor")]
@@ -65,7 +69,7 @@ pub enum Command {
     },
     #[structopt(name = "open", about = "Open project in default code editor")]
     Open,
-    #[structopt(name = "update", about = "Update `tauri-mobile`")]
+    #[structopt(name = "update", about = "Update `cargo-mobile2`")]
     Update {
         #[structopt(long = "init", help = "Regenerate project if update succeeds")]
         init: bool,
@@ -78,12 +82,12 @@ pub enum Command {
         )
     )]
     #[cfg(target_os = "macos")]
-    Apple(tauri_mobile::apple::cli::Command),
+    Apple(cargo_mobile2::apple::cli::Command),
     #[structopt(
         name = "android",
         about = "Android commands (tip: type less by running `cargo android` instead!)"
     )]
-    Android(tauri_mobile::android::cli::Command),
+    Android(cargo_mobile2::android::cli::Command),
     #[structopt(
         name = "doctor",
         about = "Perform a check-up on your installation and environment"
@@ -105,8 +109,8 @@ pub enum Error {
     OpenFailed(util::OpenInEditorError),
     UpdateFailed(update::Error),
     #[cfg(target_os = "macos")]
-    AppleFailed(tauri_mobile::apple::cli::Error),
-    AndroidFailed(tauri_mobile::android::cli::Error),
+    AppleFailed(cargo_mobile2::apple::cli::Error),
+    AndroidFailed(cargo_mobile2::android::cli::Error),
     DoctorFailed(doctor::Unrecoverable),
 }
 
@@ -124,7 +128,7 @@ impl Reportable for Error {
             Self::OpenFailed(err) => {
                 Report::error("Failed to open project in default code editor", err)
             }
-            Self::UpdateFailed(err) => Report::error("Failed to update `tauri-mobile`", err),
+            Self::UpdateFailed(err) => Report::error("Failed to update `cargo-mobile2`", err),
             #[cfg(target_os = "macos")]
             Self::AppleFailed(err) => err.report(),
             Self::AndroidFailed(err) => err.report(),
@@ -148,6 +152,10 @@ impl Exec for Input {
         match command {
             Command::Init {
                 skip_dev_tools: cli::SkipDevTools { skip_dev_tools },
+                skip_targets_install:
+                    cli::SkipTargetsInstall {
+                        skip_targets_install,
+                    },
                 reinstall_deps: cli::ReinstallDeps { reinstall_deps },
                 open_in_editor,
                 submodule_commit,
@@ -155,15 +163,20 @@ impl Exec for Input {
                 wrapper,
                 non_interactive,
                 skip_dev_tools,
+                skip_targets_install,
                 reinstall_deps,
                 open_in_editor,
                 submodule_commit,
                 ".",
             )
             .map(|_| ())
-            .map_err(Error::InitFailed),
+            .map_err(|e| Error::InitFailed(*e)),
             Command::New {
                 skip_dev_tools: cli::SkipDevTools { skip_dev_tools },
+                skip_targets_install:
+                    cli::SkipTargetsInstall {
+                        skip_targets_install,
+                    },
                 reinstall_deps: cli::ReinstallDeps { reinstall_deps },
                 open_in_editor,
                 submodule_commit,
@@ -181,13 +194,14 @@ impl Exec for Input {
                     wrapper,
                     non_interactive,
                     skip_dev_tools,
+                    skip_targets_install,
                     reinstall_deps,
                     open_in_editor,
                     submodule_commit,
                     ".",
                 )
                 .map(|_| ())
-                .map_err(Error::InitFailed)
+                .map_err(|e| Error::InitFailed(*e))
             }
             Command::Open => util::open_in_editor(".").map_err(Error::OpenFailed),
             Command::Update { init } => {
@@ -200,17 +214,18 @@ impl Exec for Input {
                         Default::default(),
                         Default::default(),
                         Default::default(),
+                        Default::default(),
                         ".",
                     )
-                    .map_err(Error::InitFailed)?;
+                    .map_err(|e| Error::InitFailed(*e))?;
                 }
                 Ok(())
             }
             #[cfg(target_os = "macos")]
-            Command::Apple(command) => tauri_mobile::apple::cli::Input::new(flags, command)
+            Command::Apple(command) => cargo_mobile2::apple::cli::Input::new(flags, command)
                 .exec(wrapper)
                 .map_err(Error::AppleFailed),
-            Command::Android(command) => tauri_mobile::android::cli::Input::new(flags, command)
+            Command::Android(command) => cargo_mobile2::android::cli::Input::new(flags, command)
                 .exec(wrapper)
                 .map_err(Error::AndroidFailed),
             Command::Doctor => doctor::exec(wrapper).map_err(Error::DoctorFailed),

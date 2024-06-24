@@ -1,12 +1,11 @@
 #[cfg(not(target_os = "macos"))]
 use crate::util;
-use crate::{
-    bossy,
-    util::cli::{Report, Reportable},
-};
+use crate::util::cli::{Report, Reportable};
 #[cfg(not(target_os = "macos"))]
 use std::path::PathBuf;
 use thiserror::Error;
+
+use crate::DuctExpressionExt;
 
 #[cfg(not(target_os = "macos"))]
 pub const BUNDLE_TOOL_JAR_INFO: BundletoolJarInfo = BundletoolJarInfo { version: "1.8.0" };
@@ -36,20 +35,25 @@ impl BundletoolJarInfo {
         )
     }
 
-    fn run_command(&self) -> bossy::Command {
+    fn run_command(&self) -> duct::Expression {
         let installation_path = self.installation_path();
-        bossy::Command::impure_parse("java -jar").with_arg(installation_path)
+        duct::cmd("java", ["-jar"])
+            .dup_stdio()
+            .before_spawn(move |cmd| {
+                cmd.arg(&installation_path);
+                Ok(())
+            })
     }
 }
 
-pub fn command() -> bossy::Command {
+pub fn command() -> duct::Expression {
     #[cfg(not(target_os = "macos"))]
     {
         BUNDLE_TOOL_JAR_INFO.run_command()
     }
     #[cfg(target_os = "macos")]
     {
-        bossy::Command::impure("bundletool")
+        duct::cmd!("bundletool").dup_stdio()
     }
 }
 
@@ -69,14 +73,14 @@ impl Reportable for InstallError {
 #[derive(Debug, Error)]
 pub enum InstallError {
     #[error("Failed to download `bundletool`: {0}")]
-    DownloadFailed(ureq::Error),
+    Download(Box<ureq::Error>),
     #[error("Failed to create bundletool.jar at {path}: {cause}")]
-    JarFileCreationFailed {
+    JarFileCreation {
         path: PathBuf,
         cause: std::io::Error,
     },
     #[error("Failed to copy content into bundletool.jar at {path}: {cause}")]
-    CopyToFileFailed {
+    CopyToFile {
         path: PathBuf,
         cause: std::io::Error,
     },
@@ -86,12 +90,12 @@ pub enum InstallError {
 impl Reportable for InstallError {
     fn report(&self) -> Report {
         match self {
-            Self::DownloadFailed(err) => Report::error("Failed to download `bundletool`", err),
-            Self::JarFileCreationFailed { path, cause } => Report::error(
+            Self::Download(err) => Report::error("Failed to download `bundletool`", err),
+            Self::JarFileCreation { path, cause } => Report::error(
                 format!("Failed to create bundletool.jar at {:?}", path),
                 cause,
             ),
-            Self::CopyToFileFailed { path, cause } => Report::error(
+            Self::CopyToFile { path, cause } => Report::error(
                 format!("Failed to copy content into bundletool.jar at {:?}", path),
                 cause,
             ),
@@ -106,22 +110,21 @@ pub fn install(reinstall_deps: bool) -> Result<(), InstallError> {
         if !jar_path.exists() || reinstall_deps {
             let response = ureq::get(&BUNDLE_TOOL_JAR_INFO.download_url())
                 .call()
-                .map_err(InstallError::DownloadFailed)?;
+                .map_err(Box::new)
+                .map_err(InstallError::Download)?;
             let tools_dir = util::tools_dir().unwrap();
-            std::fs::create_dir_all(&tools_dir).map_err(|cause| {
-                InstallError::JarFileCreationFailed {
-                    path: tools_dir,
-                    cause,
-                }
+            std::fs::create_dir_all(&tools_dir).map_err(|cause| InstallError::JarFileCreation {
+                path: tools_dir,
+                cause,
             })?;
             let mut out = std::fs::File::create(&jar_path).map_err(|cause| {
-                InstallError::JarFileCreationFailed {
+                InstallError::JarFileCreation {
                     path: jar_path.clone(),
                     cause,
                 }
             })?;
             std::io::copy(&mut response.into_reader(), &mut out).map_err(|cause| {
-                InstallError::CopyToFileFailed {
+                InstallError::CopyToFile {
                     path: jar_path,
                     cause,
                 }

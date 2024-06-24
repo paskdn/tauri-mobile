@@ -1,8 +1,8 @@
-use crate::{bossy, util};
-use once_cell_regex::exports::once_cell::sync::OnceCell;
+use crate::util;
 use std::{
     collections::BTreeMap,
     fmt::{self, Debug, Display},
+    process::ExitStatus,
 };
 
 pub trait TargetTrait<'a>: Debug + Sized {
@@ -10,13 +10,7 @@ pub trait TargetTrait<'a>: Debug + Sized {
 
     fn all() -> &'a BTreeMap<&'a str, Self>;
 
-    fn name_list() -> &'static [&'a str]
-    where
-        Self: 'static,
-    {
-        static INSTANCE: OnceCell<Vec<&str>> = OnceCell::new();
-        INSTANCE.get_or_init(|| Self::all().keys().map(|key| *key).collect::<Vec<_>>())
-    }
+    fn name_list() -> Vec<&'a str>;
 
     fn default_ref() -> &'a Self {
         Self::all()
@@ -36,11 +30,11 @@ pub trait TargetTrait<'a>: Debug + Sized {
 
     fn arch(&'a self) -> &'a str;
 
-    fn install(&'a self) -> bossy::Result<bossy::ExitStatus> {
+    fn install(&'a self) -> Result<ExitStatus, std::io::Error> {
         util::rustup_add(self.triple())
     }
 
-    fn install_all() -> bossy::Result<()>
+    fn install_all() -> Result<(), std::io::Error>
     where
         Self: 'a,
     {
@@ -67,6 +61,7 @@ impl Display for TargetInvalid {
     }
 }
 
+#[allow(clippy::type_complexity)]
 pub fn get_targets<'a, Iter, I, T, U>(
     targets: Iter,
     // we use `dyn` so the type doesn't need to be known when this is `None`

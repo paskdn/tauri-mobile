@@ -1,8 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="{{reverse-domain app.domain}}.{{snake-case app.name}}">
-    {{~#each android-app-permissions}}
-    <uses-permission android:name="{{this}}" />{{/each}}
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    {{#if android-app-permissions}}{{~#each android-app-permissions}}
+    <uses-permission android:name="{{this}}" />{{/each}}{{/if}}
     <application android:hasCode="{{has-code}}" android:supportsRtl="true" android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name" android:theme="@style/AppTheme">
         <activity android:configChanges="orientation|keyboardHidden" android:exported="true"
@@ -11,7 +10,6 @@
             <meta-data android:name="android.app.func_name" android:value="ANativeActivity_onCreate" />
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
-
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>

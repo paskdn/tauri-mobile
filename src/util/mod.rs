@@ -9,17 +9,21 @@ pub use self::{cargo::*, git::*, path::*};
 
 use self::cli::{Report, Reportable};
 use crate::{
-    bossy,
     env::ExplicitEnv,
     os::{self, command_path},
+    DuctExpressionExt,
 };
 use once_cell_regex::{exports::regex::Captures, exports::regex::Regex, regex};
+use path_abs::PathOps;
 use serde::{ser::Serializer, Deserialize, Serialize};
 use std::{
     error::Error as StdError,
+    ffi::OsStr,
     fmt::{self, Debug, Display},
-    io::{self, Write},
+    io,
     path::{Path, PathBuf},
+    process::ExitStatus,
+    str::FromStr,
 };
 use thiserror::Error;
 
@@ -47,10 +51,11 @@ pub fn reverse_domain(domain: &str) -> String {
     domain.split('.').rev().collect::<Vec<_>>().join(".")
 }
 
-pub fn rustup_add(triple: &str) -> bossy::Result<bossy::ExitStatus> {
-    bossy::Command::impure("rustup")
-        .with_args(&["target", "add", triple])
-        .run_and_wait()
+pub fn rustup_add(triple: &str) -> Result<ExitStatus, std::io::Error> {
+    duct::cmd("rustup", ["target", "add", triple])
+        .dup_stdio()
+        .run()
+        .map(|o| o.status)
 }
 
 #[derive(Debug, Error)]
@@ -70,7 +75,7 @@ impl Reportable for HostTargetTripleError {
 pub fn host_target_triple() -> Result<String, HostTargetTripleError> {
     // TODO: add fast paths
     run_and_search(
-        &mut bossy::Command::impure_parse("rustc --verbose --version"),
+        &mut duct::cmd("rustc", ["--verbose", "--version"]),
         regex!(r"host: ([\w-]+)"),
         |_text, caps| {
             let triple = caps[1].to_owned();
@@ -138,6 +143,50 @@ impl Serialize for VersionTriple {
     }
 }
 
+impl FromStr for VersionTriple {
+    type Err = VersionTripleError;
+
+    fn from_str(v: &str) -> Result<Self, Self::Err> {
+        match v.split('.').count() {
+            1 => Ok(VersionTriple {
+                major: v
+                    .parse()
+                    .map_err(|source| VersionTripleError::MajorInvalid {
+                        version: v.to_owned(),
+                        source,
+                    })?,
+                minor: 0,
+                patch: 0,
+            }),
+            2 => {
+                let mut s = v.split('.');
+                Ok(VersionTriple {
+                    major: s.next().unwrap().parse().map_err(|source| {
+                        VersionTripleError::MajorInvalid {
+                            version: v.to_owned(),
+                            source,
+                        }
+                    })?,
+                    minor: s.next().unwrap().parse().map_err(|source| {
+                        VersionTripleError::MinorInvalid {
+                            version: v.to_owned(),
+                            source,
+                        }
+                    })?,
+                    patch: 0,
+                })
+            }
+            3 => {
+                let mut s = v.split('.');
+                Self::from_split(&mut s, v)
+            }
+            _ => Err(VersionTripleError::VersionStringInvalid {
+                version: v.to_owned(),
+            }),
+        }
+    }
+}
+
 impl VersionTriple {
     pub const fn new(major: u32, minor: u32, patch: u32) -> Self {
         Self {
@@ -149,27 +198,21 @@ impl VersionTriple {
 
     pub fn from_caps<'a>(caps: &'a Captures<'a>) -> Result<(Self, &'a str), VersionTripleError> {
         let version_str = &caps["version"];
+        let parse_major = parse!("major", VersionTripleError, MajorInvalid, version);
+        let parse_minor = parse!("minor", VersionTripleError, MinorInvalid, version);
+        let parse_patch = parse!("patch", VersionTripleError, PatchInvalid, version);
         Ok((
             Self {
-                major: parse!("major", VersionTripleError, MajorInvalid, version)(
-                    &caps,
-                    version_str,
-                )?,
-                minor: parse!("minor", VersionTripleError, MinorInvalid, version)(
-                    &caps,
-                    version_str,
-                )?,
-                patch: parse!("patch", VersionTripleError, PatchInvalid, version)(
-                    &caps,
-                    version_str,
-                )?,
+                major: parse_major(caps, version_str)?,
+                minor: parse_minor(caps, version_str)?,
+                patch: parse_patch(caps, version_str)?,
             },
             version_str,
         ))
     }
 
     pub fn from_split(
-        split: &mut std::str::Split<&str>,
+        split: &mut std::str::Split<char>,
         version: &str,
     ) -> Result<Self, VersionTripleError> {
         Ok(VersionTriple {
@@ -192,46 +235,6 @@ impl VersionTriple {
                 }
             })?,
         })
-    }
-
-    pub fn from_str(v: &str) -> Result<Self, VersionTripleError> {
-        match v.split(".").count() {
-            1 => Ok(VersionTriple {
-                major: v
-                    .parse()
-                    .map_err(|source| VersionTripleError::MajorInvalid {
-                        version: v.to_owned(),
-                        source,
-                    })?,
-                minor: 0,
-                patch: 0,
-            }),
-            2 => {
-                let mut s = v.split(".");
-                Ok(VersionTriple {
-                    major: s.next().unwrap().parse().map_err(|source| {
-                        VersionTripleError::MajorInvalid {
-                            version: v.to_owned(),
-                            source,
-                        }
-                    })?,
-                    minor: s.next().unwrap().parse().map_err(|source| {
-                        VersionTripleError::MinorInvalid {
-                            version: v.to_owned(),
-                            source,
-                        }
-                    })?,
-                    patch: 0,
-                })
-            }
-            3 => {
-                let mut s = v.split(".");
-                Self::from_split(&mut s, v)
-            }
-            _ => Err(VersionTripleError::VersionStringInvalid {
-                version: v.to_owned(),
-            }),
-        }
     }
 }
 
@@ -275,13 +278,11 @@ impl Serialize for VersionDouble {
     }
 }
 
-impl VersionDouble {
-    pub const fn new(major: u32, minor: u32) -> Self {
-        Self { major, minor }
-    }
+impl FromStr for VersionDouble {
+    type Err = VersionDoubleError;
 
-    pub fn from_str(v: &str) -> Result<Self, VersionDoubleError> {
-        match v.split(".").count() {
+    fn from_str(v: &str) -> Result<Self, Self::Err> {
+        match v.split('.').count() {
             1 => Ok(VersionDouble {
                 major: v
                     .parse()
@@ -292,7 +293,7 @@ impl VersionDouble {
                 minor: 0,
             }),
             2 => {
-                let mut s = v.split(".");
+                let mut s = v.split('.');
                 Ok(VersionDouble {
                     major: s.next().unwrap().parse().map_err(|source| {
                         VersionDoubleError::MajorInvalid {
@@ -312,6 +313,12 @@ impl VersionDouble {
                 version: v.to_owned(),
             }),
         }
+    }
+}
+
+impl VersionDouble {
+    pub const fn new(major: u32, minor: u32) -> Self {
+        Self { major, minor }
     }
 }
 
@@ -395,7 +402,7 @@ impl Display for RustVersion {
 impl RustVersion {
     pub fn check() -> Result<Self, RustVersionError> {
         run_and_search(
-            &mut bossy::Command::impure_parse("rustc --version"),
+            &mut duct::cmd("rustc", ["--version"]),
             regex!(
                 r"rustc (?P<version>(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)(-(?P<flavor>\w+)(.(?P<candidate>\d+))?)?)(?P<details> \((?P<hash>\w{9}) (?P<date>(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2}))\))?"
             ),
@@ -413,18 +420,15 @@ impl RustVersion {
                         .name("details")
                         .map(|_details| -> Result<_, RustVersionError> {
                             let date_str = &caps["date"];
+                            let parse_year = parse!("year", RustVersionError, YearInvalid, date);
+                            let parse_month = parse!("month", RustVersionError, MonthInvalid, date);
+                            let parse_day = parse!("day", RustVersionError, DayInvalid, date);
                             Ok(RustVersionDetails {
                                 hash: caps["hash"].to_owned(),
                                 date: (
-                                    parse!("year", RustVersionError, YearInvalid, date)(
-                                        &caps, date_str,
-                                    )?,
-                                    parse!("month", RustVersionError, MonthInvalid, date)(
-                                        &caps, date_str,
-                                    )?,
-                                    parse!("day", RustVersionError, DayInvalid, date)(
-                                        &caps, date_str,
-                                    )?,
+                                    parse_year(&caps, date_str)?,
+                                    parse_month(&caps, date_str)?,
+                                    parse_day(&caps, date_str)?,
                                 ),
                             })
                         })
@@ -464,22 +468,18 @@ pub fn prepend_to_path(path: impl Display, base_path: impl Display) -> String {
     format!("{}:{}", path, base_path)
 }
 
-pub fn command_present(name: &str) -> bossy::Result<bool> {
-    command_path(name).map(|_path| true).or_else(|err| {
-        if err.code().is_some() {
-            Ok(false)
-        } else {
-            Err(err)
-        }
-    })
+pub fn command_present(name: &str) -> Result<bool, std::io::Error> {
+    command_path(name)
+        .map(|_path| true)
+        .or_else(|_err| Ok(false))
 }
 
 #[derive(Debug)]
 pub enum PipeError {
-    TxCommandFailed(bossy::Error),
-    RxCommandFailed(bossy::Error),
+    TxCommandFailed(std::io::Error),
+    RxCommandFailed(std::io::Error),
     PipeFailed(io::Error),
-    WaitFailed(bossy::Error),
+    WaitFailed(std::io::Error),
 }
 
 impl Display for PipeError {
@@ -495,56 +495,31 @@ impl Display for PipeError {
     }
 }
 
-pub fn pipe(mut tx_command: bossy::Command, rx_command: bossy::Command) -> Result<bool, PipeError> {
-    let tx_output = tx_command
-        .run_and_wait_for_output()
-        .map_err(PipeError::TxCommandFailed)?;
-    if !tx_output.stdout().is_empty() {
-        let mut rx_command = rx_command
-            .with_stdin_piped()
-            .with_stdout(bossy::Stdio::inherit())
-            .run()
-            .map_err(PipeError::RxCommandFailed)?;
-        let pipe_result = rx_command
-            .stdin()
-            .expect("developer error: `rx_command` stdin not captured")
-            .write_all(tx_output.stdout())
-            .map_err(PipeError::PipeFailed);
-        let wait_result = rx_command.wait_for_output().map_err(PipeError::WaitFailed);
-        // We try to wait even if the pipe failed, but the pipe error has higher
-        // priority than the wait error, since it's likely to be more relevant.
-        pipe_result?;
-        wait_result?;
-        Ok(true)
-    } else {
-        Ok(false)
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum RunAndSearchError {
     #[error(transparent)]
-    CommandFailed(#[from] bossy::Error),
+    CommandFailed(#[from] std::io::Error),
     #[error("{command:?} output failed to match regex: {output:?}")]
     SearchFailed { command: String, output: String },
 }
 
 pub fn run_and_search<T>(
-    command: &mut bossy::Command,
+    command: &mut duct::Expression,
     re: &Regex,
     f: impl FnOnce(&str, Captures<'_>) -> T,
 ) -> Result<T, RunAndSearchError> {
-    let command_string = command.display().to_owned();
-    Ok(command
-        .run_and_wait_for_str(|output| {
-            re.captures(output)
+    let command_string = format!("{command:?}");
+    command
+        .read()
+        .map(|output| {
+            re.captures(&output)
                 .ok_or_else(|| RunAndSearchError::SearchFailed {
                     command: command_string,
                     output: output.to_owned(),
                 })
-                .map(|caps| f(output, caps))
+                .map(|caps| f(&output, caps))
         })
-        .map_err(RunAndSearchError::from)??)
+        .map_err(RunAndSearchError::from)?
 }
 
 #[derive(Debug, Error)]
@@ -648,7 +623,7 @@ where
     let result = f().map_err(E::from)?;
     std::env::set_current_dir(&current_dir).map_err(|source| {
         WithWorkingDirError::CurrentDirSetFailed {
-            path: current_dir.into(),
+            path: current_dir,
             source,
         }
     })?;
@@ -687,6 +662,34 @@ impl<T: Debug> Serialize for OneOrMany<T> {
 pub fn gradlew(
     config: &crate::android::config::Config,
     env: &crate::android::env::Env,
-) -> bossy::Command {
-    os::gradlew_command(&config.project_dir()).with_env_vars(env.explicit_env())
+) -> duct::Expression {
+    let project_dir = config.project_dir();
+    #[cfg(windows)]
+    let (gradlew, gradle) = ("gradlew.bat", "gradle.bat");
+    #[cfg(not(windows))]
+    let (gradlew, gradle) = ("gradlew", "gradle");
+
+    let project_dir = dunce::simplified(&project_dir);
+    let gradlew_p = project_dir.join(gradlew);
+    if gradlew_p.exists() {
+        duct::cmd(
+            gradlew_p,
+            [OsStr::new("--project-dir"), project_dir.as_ref()],
+        )
+        .vars(env.explicit_env())
+        .dup_stdio()
+    } else if duct::cmd(gradlew, ["-v"])
+        .dup_stdio()
+        .run()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        duct::cmd(gradlew, [OsStr::new("--project-dir"), project_dir.as_ref()])
+            .vars(env.explicit_env())
+            .dup_stdio()
+    } else {
+        duct::cmd(gradle, [OsStr::new("--project-dir"), project_dir.as_ref()])
+            .vars(env.explicit_env())
+            .dup_stdio()
+    }
 }

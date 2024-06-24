@@ -3,7 +3,6 @@ use super::{
     target::Target,
 };
 use crate::{
-    bossy,
     os::consts,
     util::{
         cli::{Report, Reportable},
@@ -156,7 +155,7 @@ pub enum RequiredLibsError {
     #[error(transparent)]
     MissingTool(#[from] MissingToolError),
     #[error(transparent)]
-    ReadElfFailed(#[from] bossy::Error),
+    ReadElfFailed(#[from] std::io::Error),
     #[error("`readelf` output contained invalid UTF-8: {0}")]
     InvalidUtf8(#[from] std::str::Utf8Error),
 }
@@ -248,13 +247,22 @@ impl Env {
 
     pub fn libcxx_shared_path(&self, target: Target<'_>) -> Result<PathBuf, MissingToolError> {
         static LIB: &str = "libc++_shared.so";
-        MissingToolError::check_file(
+        let ndk_ver = self.version().unwrap_or_default();
+        let so_path = if ndk_ver.triple.major >= 22 {
+            let ndk_triple = if target.triple == "armv7-linux-androideabi" {
+                "arm-linux-androideabi"
+            } else {
+                target.triple
+            };
+            self.prebuilt_dir()?
+                .join("sysroot/usr/lib")
+                .join(ndk_triple)
+        } else {
             self.ndk_home
                 .join("sources/cxx-stl/llvm-libc++/libs")
                 .join(target.abi)
-                .join(LIB),
-            LIB,
-        )
+        };
+        MissingToolError::check_file(so_path.join(LIB), LIB)
     }
 
     pub fn ar_path(&self, triple: &str) -> Result<PathBuf, MissingToolError> {
@@ -282,13 +290,17 @@ impl Env {
         elf: &Path,
         triple: &str,
     ) -> Result<HashSet<String>, RequiredLibsError> {
+        let elf_path = dunce::simplified(elf).to_owned();
         Ok(regex_multi_line!(r"\(NEEDED\)\s+Shared library: \[(.+)\]")
             .captures_iter(
-                bossy::Command::impure(self.readelf_path(triple)?)
-                    .with_arg("-d")
-                    .with_arg(dunce::simplified(elf))
-                    .run_and_wait_for_output()?
-                    .stdout_str()?,
+                duct::cmd(self.readelf_path(triple)?, ["-d"])
+                    .before_spawn(move |cmd| {
+                        cmd.arg(&elf_path);
+                        Ok(())
+                    })
+                    .stderr_capture()
+                    .read()?
+                    .as_str(),
             )
             .map(|caps| {
                 let lib = caps

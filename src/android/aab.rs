@@ -6,7 +6,6 @@ use thiserror::Error;
 
 use super::{config::Config, env::Env, target::Target};
 use crate::{
-    bossy,
     opts::{NoiseLevel, Profile},
     util::{
         cli::{Report, Reportable},
@@ -15,29 +14,15 @@ use crate::{
 };
 
 #[derive(Debug, Error)]
-pub enum AabBuildError {
-    #[error("Failed to build AAB: {0}")]
-    BuildFailed(bossy::Error),
-}
-
-impl Reportable for AabBuildError {
-    fn report(&self) -> Report {
-        match self {
-            Self::BuildFailed(err) => Report::error("Failed to build AAB", err),
-        }
-    }
-}
-
-#[derive(Debug, Error)]
 pub enum AabError {
-    #[error(transparent)]
-    AabBuildError(AabBuildError),
+    #[error("Failed to build AAB: {0}")]
+    BuildFailed(#[from] std::io::Error),
 }
 
 impl Reportable for AabError {
     fn report(&self) -> Report {
         match self {
-            Self::AabBuildError(err) => err.report(),
+            Self::BuildFailed(err) => Report::error("Failed to build AAB", err),
         }
     }
 }
@@ -59,24 +44,48 @@ pub fn build(
             .map(|t| format!("bundle{}{}", t.arch_upper_camel_case(), build_ty))
             .collect()
     } else {
-        vec![
-            format!("bundleUniversal{}", build_ty),
-            format!(
-                "-PabiList={}",
-                targets.iter().map(|t| t.abi).collect::<Vec<_>>().join(",")
-            ),
-        ]
+        let mut args = vec![format!("bundleUniversal{}", build_ty)];
+
+        if !targets.is_empty() {
+            args.extend_from_slice(&[
+                format!(
+                    "-PabiList={}",
+                    targets.iter().map(|t| t.abi).collect::<Vec<_>>().join(",")
+                ),
+                format!(
+                    "-ParchList={}",
+                    targets.iter().map(|t| t.arch).collect::<Vec<_>>().join(",")
+                ),
+                format!(
+                    "-PtargetList={}",
+                    targets
+                        .iter()
+                        .map(|t| t.triple.split('-').next().unwrap())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+            ])
+        }
+
+        args
     };
     gradlew(config, env)
-        .with_args(gradle_args)
-        .with_arg(match noise_level {
-            NoiseLevel::Polite => "--warn",
-            NoiseLevel::LoudAndProud => "--info",
-            NoiseLevel::FranklyQuitePedantic => "--debug",
+        .before_spawn(move |cmd| {
+            cmd.args(&gradle_args).arg(match noise_level {
+                NoiseLevel::Polite => "--warn",
+                NoiseLevel::LoudAndProud => "--info",
+                NoiseLevel::FranklyQuitePedantic => "--debug",
+            });
+            Ok(())
         })
-        .run_and_wait()
-        .map_err(AabBuildError::BuildFailed)
-        .map_err(AabError::AabBuildError)?;
+        .start()
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+               log::error!("`gradlew` not found. Make sure you have the Android SDK installed and added to your PATH");
+            }
+            err
+        })?
+        .wait()?;
 
     let mut outputs = Vec::new();
     if split_per_abi {
@@ -96,8 +105,9 @@ pub fn aab_path(config: &Config, profile: Profile, flavor: &str) -> PathBuf {
     prefix_path(
         config.project_dir(),
         format!(
-            "app/build/outputs/{}/app-{}-{}.{}",
-            format!("bundle/{}{}", flavor, profile.as_str_pascal_case()),
+            "app/build/outputs/bundle/{}{}/app-{}-{}.{}",
+            flavor,
+            profile.as_str_pascal_case(),
             flavor,
             profile.as_str(),
             "aab"
@@ -121,7 +131,7 @@ pub mod cli {
             if split_per_abi { "(s)" } else { "" },
             targets
                 .iter()
-                .map(|t| t.triple.split("-").next().unwrap())
+                .map(|t| t.triple.split('-').next().unwrap())
                 .collect::<Vec<_>>()
                 .join(", ")
         );

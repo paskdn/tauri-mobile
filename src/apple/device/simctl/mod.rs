@@ -1,9 +1,8 @@
-use super::target::Target;
+use super::super::target::Target;
+use super::DeviceKind;
 use crate::apple::device::Device as AppleDevice;
-use crate::{
-    bossy,
-    env::{Env, ExplicitEnv},
-};
+use crate::env::{Env, ExplicitEnv};
+use crate::DuctExpressionExt;
 use serde::Deserialize;
 
 use std::fmt::Display;
@@ -11,8 +10,8 @@ use std::fmt::Display;
 mod device_list;
 mod run;
 
-pub use device_list::{device_list, DeviceListError};
-pub use run::{run, RunError};
+pub use device_list::device_list;
+pub use run::run;
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Device {
@@ -38,8 +37,8 @@ impl<'a> From<Device> for AppleDevice<'a> {
                 "x86_64"
             })
             .unwrap(),
+            DeviceKind::Simulator,
         )
-        .simulator()
     }
 }
 
@@ -48,16 +47,25 @@ impl Device {
         &self.name
     }
 
-    pub fn start(&self, env: &Env) -> bossy::Result<bossy::Handle> {
-        bossy::Command::impure("open")
-            .with_args(&[
+    fn command(&self, env: &Env) -> duct::Expression {
+        duct::cmd(
+            "open",
+            [
                 "-a",
                 "Simulator",
                 "--args",
                 "-CurrentDeviceUDID",
                 &self.udid,
-            ])
-            .with_env_vars(env.explicit_env())
-            .run()
+            ],
+        )
+        .vars(env.explicit_env())
+        .dup_stdio()
+    }
+
+    pub fn start(&self, env: &Env) -> std::io::Result<duct::Handle> {
+        self.command(env).start()
+    }
+    pub fn start_detached(&self, env: &Env) -> std::io::Result<()> {
+        self.command(env).run_and_detach()
     }
 }

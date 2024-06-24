@@ -1,12 +1,11 @@
 use crate::{
     apple::{
         config::{Config, Metadata},
-        device::{Device, RunError},
-        ios_deploy, rust_version_check,
+        device::{self, Device, RunError},
+        rust_version_check,
         target::{ArchiveError, BuildError, CheckError, CompileLibError, ExportError, Target},
         NAME,
     },
-    bossy,
     config::{
         metadata::{self, Metadata as OmniMetadata},
         Config as OmniConfig, LoadOrGenError,
@@ -66,12 +65,12 @@ pub enum Command {
     Open,
     #[structopt(name = "check", about = "Checks if code compiles for target(s)")]
     Check {
-        #[structopt(name = "targets", default_value = Target::DEFAULT_KEY, possible_values = Target::name_list())]
+        #[structopt(name = "targets", default_value = Target::DEFAULT_KEY, possible_values = &Target::name_list())]
         targets: Vec<String>,
     },
     #[structopt(name = "build", about = "Builds static libraries for target(s)")]
     Build {
-        #[structopt(name = "targets", default_value = Target::DEFAULT_KEY, possible_values = Target::name_list())]
+        #[structopt(name = "targets", default_value = Target::DEFAULT_KEY, possible_values = &Target::name_list())]
         targets: Vec<String>,
         #[structopt(flatten)]
         profile: cli::Profile,
@@ -80,7 +79,7 @@ pub enum Command {
     Archive {
         #[structopt(long = "build-number")]
         build_number: Option<u32>,
-        #[structopt(name = "targets", default_value = Target::DEFAULT_KEY, possible_values = Target::name_list())]
+        #[structopt(name = "targets", default_value = Target::DEFAULT_KEY, possible_values = &Target::name_list())]
         targets: Vec<String>,
         #[structopt(flatten)]
         profile: cli::Profile,
@@ -153,7 +152,7 @@ pub enum Command {
 pub enum Error {
     EnvInitFailed(EnvError),
     RustVersionCheckFailed(util::RustVersionError),
-    DevicePromptFailed(PromptError<ios_deploy::DeviceListError>),
+    DevicePromptFailed(PromptError<String>),
     TargetInvalid(TargetInvalid),
     ConfigFailed(LoadOrGenError),
     MetadataFailed(metadata::Error),
@@ -165,15 +164,15 @@ pub enum Error {
     ArchiveFailed(ArchiveError),
     ExportFailed(ExportError),
     RunFailed(RunError),
-    ListFailed(ios_deploy::DeviceListError),
+    ListFailed(String),
     NoHomeDir(util::NoHomeDir),
-    CargoEnvFailed(bossy::Error),
+    CargoEnvFailed(std::io::Error),
     SdkRootInvalid { sdk_root: PathBuf },
     IncludeDirInvalid { include_dir: PathBuf },
     MacosSdkRootInvalid { macos_sdk_root: PathBuf },
     ArchInvalid { arch: String },
     CompileLibFailed(CompileLibError),
-    PodCommandFailed(bossy::Error),
+    PodCommandFailed(std::io::Error),
     CopyLibraryFailed(std::io::Error),
     LibNotFound { path: PathBuf },
 }
@@ -198,7 +197,7 @@ impl Reportable for Error {
             Self::ArchiveFailed(err) => err.report(),
             Self::ExportFailed(err) => err.report(),
             Self::RunFailed(err) => err.report(),
-            Self::ListFailed(err) => err.report(),
+            Self::ListFailed(err) => Report::error("Failed to list devices", err),
             Self::NoHomeDir(err) => Report::error("Failed to load cargo env profile", err),
             Self::CargoEnvFailed(err) => Report::error("Failed to load cargo env profile", err),
             Self::SdkRootInvalid { sdk_root } => Report::error(
@@ -233,7 +232,7 @@ impl Exec for Input {
     }
 
     fn exec(self, wrapper: &TextWrapper) -> Result<(), Self::Report> {
-        define_device_prompt!(ios_deploy::device_list, ios_deploy::DeviceListError, iOS);
+        define_device_prompt!(crate::apple::device::list_devices, String, iOS);
         fn detect_target_ok<'a>(env: &Env) -> Option<&'a Target<'a>> {
             device_prompt(env).map(|device| device.target()).ok()
         }
@@ -246,7 +245,7 @@ impl Exec for Input {
             let (config, _origin) = OmniConfig::load_or_gen(".", non_interactive, wrapper)
                 .map_err(Error::ConfigFailed)?;
             let metadata =
-                OmniMetadata::load(&config.app().root_dir()).map_err(Error::MetadataFailed)?;
+                OmniMetadata::load(config.app().root_dir()).map_err(Error::MetadataFailed)?;
             if metadata.apple().supported() {
                 f(config.apple(), metadata.apple())
             } else {
@@ -357,25 +356,26 @@ impl Exec for Input {
                     .map_err(Error::DevicePromptFailed)?
                     .run(config, &env, noise_level, non_interactive, profile)
                     .and_then(|h| {
-                        h.wait().map(|_| ()).map_err(|e| {
-                            RunError::DeployFailed(ios_deploy::RunAndDebugError::DeployFailed(e))
-                        })
+                        h.wait()
+                            .map(|_| ())
+                            .map_err(|e| RunError::DeployFailed(e.to_string()))
                     })
                     .map_err(Error::RunFailed)
             }),
-            Command::List => ios_deploy::device_list(&env)
-                .map_err(Error::ListFailed)
-                .map(|device_list| {
-                    prompt::list_display_only(device_list.iter(), device_list.len());
-                }),
-            Command::Pod { arguments } => with_config(non_interactive, wrapper, |config, _| {
-                bossy::Command::impure_parse("pod")
-                    .with_args(arguments)
-                    .with_arg(format!(
-                        "--project-directory={}",
-                        config.project_dir().display()
-                    ))
-                    .run_and_wait()
+            Command::List => {
+                device::list_devices(&env)
+                    .map_err(Error::ListFailed)
+                    .map(|device_list| {
+                        prompt::list_display_only(device_list.iter(), device_list.len());
+                    })
+            }
+            Command::Pod { mut arguments } => with_config(non_interactive, wrapper, |config, _| {
+                arguments.push(format!(
+                    "--project-directory={}",
+                    config.project_dir().display()
+                ));
+                duct::cmd("pod", arguments)
+                    .run()
                     .map_err(Error::PodCommandFailed)?;
                 Ok(())
             }),
@@ -443,9 +443,17 @@ impl Exec for Input {
                 let isysroot = format!("-isysroot {}", sdk_root.display());
 
                 for arch in arches {
+                    // FIXME Build the rust crate for iOS Simulator target too.
+                    if arch == "Simulator" {
+                        continue;
+                    }
+
                     // Set target-specific flags
                     let (triple, rust_triple) = match arch.as_str() {
                         "arm64" => ("aarch64_apple_ios", "aarch64-apple-ios"),
+                        // FIXME triple for cflags seems incorrect and we don't actually need to
+                        // set it when cross compile simulator target.
+                        // "arm64-sim" => ("aarch64_apple_ios", "aarch64-apple-ios"),
                         "x86_64" => ("x86_64_apple_ios", "x86_64-apple-ios"),
                         _ => return Err(Error::ArchInvalid { arch }),
                     };
@@ -456,11 +464,11 @@ impl Exec for Input {
                     target_env.insert(cflags.as_ref(), isysroot.as_ref());
                     target_env.insert(cxxflags.as_ref(), isysroot.as_ref());
                     target_env.insert(objc_include_path.as_ref(), include_dir.as_ref());
-                    // Prevents linker errors in build scripts and proc macros:
-                    // https://github.com/signalapp/libsignal-client/commit/02899cac643a14b2ced7c058cc15a836a2165b6d
-                    target_env.insert("LIBRARY_PATH", library_path.as_ref());
 
                     let target = if macos {
+                        // Prevents linker errors in build scripts and proc macros:
+                        // https://github.com/signalapp/libsignal-client/commit/02899cac643a14b2ced7c058cc15a836a2165b6d
+                        target_env.insert("LIBRARY_PATH", library_path.as_ref());
                         &macos_target
                     } else {
                         Target::for_arch(&arch).ok_or_else(|| Error::ArchInvalid {

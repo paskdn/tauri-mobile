@@ -4,7 +4,7 @@ use super::{
     target::Target,
 };
 use crate::{
-    bicycle, bossy,
+    bicycle,
     target::TargetTrait as _,
     templating::{self, Pack},
     util::{
@@ -12,6 +12,7 @@ use crate::{
         cli::{Report, Reportable, TextWrapper},
         ln,
     },
+    DuctExpressionExt,
 };
 use std::path::{Path, PathBuf};
 
@@ -19,7 +20,7 @@ pub static TEMPLATE_PACK: &str = "xcode";
 
 #[derive(Debug)]
 pub enum Error {
-    RustupFailed(bossy::Error),
+    RustupFailed(std::io::Error),
     RustVersionCheckFailed(util::RustVersionError),
     DepsInstallFailed(deps::Error),
     MissingPack(templating::LookupError),
@@ -29,8 +30,8 @@ pub enum Error {
         path: PathBuf,
         cause: std::io::Error,
     },
-    XcodegenFailed(bossy::Error),
-    PodInstallFailed(bossy::Error),
+    XcodegenFailed(std::io::Error),
+    PodInstallFailed(std::io::Error),
 }
 
 impl Reportable for Error {
@@ -60,6 +61,7 @@ impl Reportable for Error {
 
 // unprefixed app_root seems pretty dangerous!!
 // TODO: figure out what I meant by that
+#[allow(clippy::too_many_arguments)]
 pub fn gen(
     config: &Config,
     metadata: &Metadata,
@@ -70,9 +72,12 @@ pub fn gen(
     skip_dev_tools: bool,
     reinstall_deps: bool,
     filter: &templating::Filter,
+    skip_targets_install: bool,
 ) -> Result<(), Error> {
-    println!("Installing iOS toolchains...");
-    Target::install_all().map_err(Error::RustupFailed)?;
+    if !skip_targets_install {
+        println!("Installing iOS toolchains...");
+        Target::install_all().map_err(Error::RustupFailed)?;
+    }
     rust_version_check(wrapper).map_err(Error::RustVersionCheckFailed)?;
 
     deps::install_all(wrapper, non_interactive, skip_dev_tools, reinstall_deps)
@@ -108,10 +113,7 @@ pub fn gen(
             map.insert("ios-frameworks", metadata.ios().frameworks());
             map.insert(
                 "ios-valid-archs",
-                metadata
-                    .ios()
-                    .valid_archs()
-                    .unwrap_or_else(|| &default_archs),
+                metadata.ios().valid_archs().unwrap_or(&default_archs),
             );
             #[cfg(target_arch = "aarch64")]
             map.insert("ios-sim-arch", "aarch64-apple-ios-sim");
@@ -191,17 +193,27 @@ pub fn gen(
     // Note that Xcode doesn't always reload the project nicely; reopening is
     // often necessary.
     println!("Generating Xcode project...");
-    bossy::Command::impure("xcodegen")
-        .with_args(&["generate", "--spec"])
-        .with_arg(dest.join("project.yml"))
-        .run_and_wait()
+    let project_yml_path = dest.join("project.yml");
+    duct::cmd("xcodegen", ["generate", "--no-env", "--spec"])
+        .before_spawn(move |cmd| {
+            cmd.arg(&project_yml_path);
+            Ok(())
+        })
+        .dup_stdio()
+        .run()
         .map_err(Error::XcodegenFailed)?;
 
     if !ios_pods.is_empty() || !macos_pods.is_empty() {
-        bossy::Command::impure_parse("pod install")
-            .with_arg(format!("--project-directory={}", dest.display()))
-            .run_and_wait()
-            .map_err(Error::PodInstallFailed)?;
+        duct::cmd(
+            "pod",
+            [
+                "install",
+                &format!("--project-directory={}", dest.display()),
+            ],
+        )
+        .dup_stdio()
+        .run()
+        .map_err(Error::PodInstallFailed)?;
     }
     Ok(())
 }

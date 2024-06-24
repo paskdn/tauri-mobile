@@ -7,23 +7,22 @@ use thiserror::Error;
 use super::{config::Config, env::Env, jnilibs, target::Target};
 use crate::{
     android::jnilibs::JniLibs,
-    bossy,
     opts::{NoiseLevel, Profile},
     util::{
         cli::{Report, Reportable},
-        gradlew, prefix_path,
+        gradlew, last_modified, prefix_path,
     },
 };
 
 #[derive(Debug, Error)]
-pub enum ApkBuildError {
+pub enum ApkError {
     #[error(transparent)]
     LibSymlinkCleaningFailed(jnilibs::RemoveBrokenLinksError),
     #[error("Failed to assemble APK: {0}")]
-    AssembleFailed(bossy::Error),
+    AssembleFailed(#[from] std::io::Error),
 }
 
-impl Reportable for ApkBuildError {
+impl Reportable for ApkError {
     fn report(&self) -> Report {
         match self {
             Self::LibSymlinkCleaningFailed(err) => err.report(),
@@ -32,36 +31,28 @@ impl Reportable for ApkBuildError {
     }
 }
 
-#[derive(Debug, Error)]
-
-pub enum ApkError {
-    #[error(transparent)]
-    ApkBuildError(ApkBuildError),
-}
-
-impl Reportable for ApkError {
-    fn report(&self) -> Report {
-        match self {
-            Self::ApkBuildError(err) => err.report(),
-        }
-    }
-}
-
-pub fn apk_path(config: &Config, profile: Profile, flavor: &str) -> PathBuf {
-    prefix_path(
-        config.project_dir(),
-        format!(
-            "app/build/outputs/{}/app-{}-{}.{}",
-            format!("apk/{}/{}", flavor, profile.as_str()),
-            flavor,
-            profile.suffix(),
-            "apk"
-        ),
-    )
+pub fn apks_paths(config: &Config, profile: Profile, flavor: &str) -> Vec<PathBuf> {
+    profile
+        .suffixes()
+        .iter()
+        .map(|suffix| {
+            prefix_path(
+                config.project_dir(),
+                format!(
+                    "app/build/outputs/apk/{}/{}/app-{}-{}.{}",
+                    flavor,
+                    profile.as_str(),
+                    flavor,
+                    suffix,
+                    "apk"
+                ),
+            )
+        })
+        .collect()
 }
 
 /// Builds APK(s) and returns the built APK(s) paths
-pub fn build<'a>(
+pub fn build(
     config: &Config,
     env: &Env,
     noise_level: NoiseLevel,
@@ -69,9 +60,7 @@ pub fn build<'a>(
     targets: Vec<&Target>,
     split_per_abi: bool,
 ) -> Result<Vec<PathBuf>, ApkError> {
-    JniLibs::remove_broken_links(config)
-        .map_err(ApkBuildError::LibSymlinkCleaningFailed)
-        .map_err(ApkError::ApkBuildError)?;
+    JniLibs::remove_broken_links(config).map_err(ApkError::LibSymlinkCleaningFailed)?;
 
     let build_ty = profile.as_str().to_upper_camel_case();
 
@@ -81,34 +70,68 @@ pub fn build<'a>(
             .map(|t| format!("assemble{}{}", t.arch_upper_camel_case(), build_ty))
             .collect()
     } else {
-        vec![
-            format!("assembleUniversal{}", build_ty),
-            format!(
-                "-PabiList={}",
-                targets.iter().map(|t| t.abi).collect::<Vec<_>>().join(",")
-            ),
-        ]
+        let mut args = vec![format!("assembleUniversal{}", build_ty)];
+
+        if !targets.is_empty() {
+            args.extend_from_slice(&[
+                format!(
+                    "-PabiList={}",
+                    targets.iter().map(|t| t.abi).collect::<Vec<_>>().join(",")
+                ),
+                format!(
+                    "-ParchList={}",
+                    targets.iter().map(|t| t.arch).collect::<Vec<_>>().join(",")
+                ),
+                format!(
+                    "-PtargetList={}",
+                    targets
+                        .iter()
+                        .map(|t| t.triple.split('-').next().unwrap())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+            ])
+        }
+
+        args
     };
+
     gradlew(config, env)
-        .with_args(gradle_args)
-        .with_arg(match noise_level {
-            NoiseLevel::Polite => "--warn",
-            NoiseLevel::LoudAndProud => "--info",
-            NoiseLevel::FranklyQuitePedantic => "--debug",
+        .before_spawn(move |cmd| {
+            cmd.args(&gradle_args).arg(match noise_level {
+                NoiseLevel::Polite => "--warn",
+                NoiseLevel::LoudAndProud => "--info",
+                NoiseLevel::FranklyQuitePedantic => "--debug",
+            });
+            Ok(())
         })
-        .run_and_wait()
-        .map_err(ApkBuildError::AssembleFailed)
-        .map_err(ApkError::ApkBuildError)?;
+        .start()
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+               log::error!("`gradlew` not found. Make sure you have the Android SDK installed and added to your PATH");
+            }
+            err
+        })?
+        .wait()?;
 
     let mut outputs = Vec::new();
     if split_per_abi {
-        outputs.extend(
-            targets
-                .iter()
-                .map(|t| dunce::simplified(&apk_path(config, profile, t.arch)).to_path_buf()),
-        );
+        let paths = targets
+            .iter()
+            .map(|t| {
+                apks_paths(config, profile, t.arch)
+                    .into_iter()
+                    .reduce(last_modified)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        outputs.extend(paths);
     } else {
-        outputs.push(dunce::simplified(&apk_path(config, profile, "universal")).to_path_buf());
+        let path = apks_paths(config, profile, "universal")
+            .into_iter()
+            .reduce(last_modified)
+            .unwrap();
+        outputs.push(path);
     }
 
     Ok(outputs)
@@ -130,7 +153,7 @@ pub mod cli {
             if split_per_abi { "(s)" } else { "" },
             targets
                 .iter()
-                .map(|t| t.triple.split("-").next().unwrap())
+                .map(|t| t.triple.split('-').next().unwrap())
                 .collect::<Vec<_>>()
                 .join(", ")
         );

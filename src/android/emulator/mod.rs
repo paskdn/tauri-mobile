@@ -3,9 +3,10 @@ mod avd_list;
 use std::{fmt::Display, path::PathBuf};
 
 pub use avd_list::avd_list;
+use duct::Handle;
 
 use super::env::Env;
-use crate::{bossy, env::ExplicitEnv};
+use crate::{env::ExplicitEnv, DuctExpressionExt};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Emulator {
@@ -27,10 +28,21 @@ impl Emulator {
         &self.name
     }
 
-    pub fn start(&self, env: &Env) -> bossy::Result<bossy::Handle> {
-        bossy::Command::impure(PathBuf::from(env.android_home()).join("emulator/emulator"))
-            .with_args(&["-avd", &self.name])
-            .with_env_vars(env.explicit_env())
-            .run()
+    fn command(&self, env: &Env) -> duct::Expression {
+        duct::cmd(
+            PathBuf::from(env.android_home()).join("emulator/emulator"),
+            ["-avd", &self.name],
+        )
+        .vars(env.explicit_env())
+        .dup_stdio()
+    }
+
+    pub fn start(&self, env: &Env) -> Result<Handle, std::io::Error> {
+        self.command(env).start()
+    }
+
+    pub fn start_detached(&self, env: &Env) -> Result<(), std::io::Error> {
+        self.command(env).run_and_detach()?;
+        Ok(())
     }
 }

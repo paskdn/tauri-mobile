@@ -2,7 +2,7 @@ mod env;
 pub(super) mod info;
 pub mod ln;
 
-use crate::{bossy, env::ExplicitEnv};
+use crate::{env::ExplicitEnv, DuctExpressionExt};
 use std::{
     ffi::{OsStr, OsString},
     os::windows::ffi::{OsStrExt, OsStringExt},
@@ -11,11 +11,10 @@ use std::{
 };
 use thiserror::Error;
 use windows::{
-    core::{self, HSTRING, PCWSTR, PWSTR},
-    w,
+    core::{self, w, PCWSTR, PWSTR},
     Win32::{
-        Foundation::{ERROR_NO_ASSOCIATION, ERROR_SUCCESS, MAX_PATH},
-        System::{Memory::LocalFree, Registry::HKEY_LOCAL_MACHINE},
+        Foundation::{LocalFree, ERROR_NO_ASSOCIATION, HLOCAL, MAX_PATH},
+        System::Registry::HKEY_LOCAL_MACHINE,
         UI::Shell::{
             AssocQueryStringW, CommandLineToArgvW, SHRegGetPathW, ASSOCF_INIT_IGNOREUNKNOWN,
             ASSOCSTR_COMMAND,
@@ -43,7 +42,7 @@ impl From<core::Error> for DetectEditorError {
 #[derive(Debug, Error)]
 pub enum OpenFileError {
     #[error("Launch Failed: {0}")]
-    LaunchFailed(#[source] bossy::Error),
+    LaunchFailed(#[source] std::io::Error),
     #[error("An error occured while calling OS API: {0}")]
     IOError(#[source] std::io::Error),
 }
@@ -52,8 +51,8 @@ pub struct Application {
     argv: Vec<OsString>,
 }
 
-const RUST_EXT: &HSTRING = w!(".rs");
-const TEXT_EXT: &HSTRING = w!(".txt");
+const RUST_EXT: PCWSTR = w!(".rs");
+const TEXT_EXT: PCWSTR = w!(".txt");
 
 impl Application {
     pub fn detect_editor() -> Result<Self, DetectEditorError> {
@@ -71,17 +70,17 @@ impl Application {
             .iter()
             .map(|arg| Self::replace_command_arg(arg, &path.as_ref().as_os_str()))
             .collect::<Vec<_>>();
-        bossy::Command::impure(&self.argv[0])
-            .with_args(&args)
+        duct::cmd(&self.argv[0], args)
             .run_and_detach()
-            .map_err(OpenFileError::LaunchFailed)
+            .map_err(OpenFileError::LaunchFailed)?;
+        Ok(())
     }
 
-    fn detect_associated_command(ext: &HSTRING) -> Result<Vec<u16>, DetectEditorError> {
+    fn detect_associated_command(ext: PCWSTR) -> Result<Vec<u16>, DetectEditorError> {
         let mut len: u32 = 0;
         if let Err(e) = unsafe {
             AssocQueryStringW(
-                ASSOCF_INIT_IGNOREUNKNOWN as u32,
+                ASSOCF_INIT_IGNOREUNKNOWN,
                 ASSOCSTR_COMMAND,
                 // In Shlwapi.h, this parameter's type is `LPCWSTR`.
                 // So it's not modified actually.
@@ -90,6 +89,7 @@ impl Application {
                 PWSTR::null(),
                 &mut len as _,
             )
+            .ok()
         } {
             if e.code().0 == (0x80070000 | ERROR_NO_ASSOCIATION.0) as i32 {
                 return Err(DetectEditorError::NoDefaultEditorSet);
@@ -99,7 +99,7 @@ impl Application {
         let mut command: Vec<u16> = vec![0; len as usize];
         unsafe {
             AssocQueryStringW(
-                ASSOCF_INIT_IGNOREUNKNOWN as u32,
+                ASSOCF_INIT_IGNOREUNKNOWN,
                 ASSOCSTR_COMMAND,
                 // In Shlwapi.h, this parameter's type is `LPCWSTR`.
                 // So it's not modified actually.
@@ -108,7 +108,8 @@ impl Application {
                 PWSTR(command.as_mut_ptr()),
                 &mut len as _,
             )
-        }?;
+            .ok()?;
+        }
         Ok(command)
     }
 
@@ -159,9 +160,9 @@ pub fn open_file_with(
     }
 }
 
-const ANDROID_STUDIO_UNINSTALL_KEY_PATH: &HSTRING =
+const ANDROID_STUDIO_UNINSTALL_KEY_PATH: PCWSTR =
     w!("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Android Studio");
-const ANDROID_STUDIO_UNINSTALLER_VALUE: &HSTRING = w!("UninstallString");
+const ANDROID_STUDIO_UNINSTALLER_VALUE: PCWSTR = w!("UninstallString");
 #[cfg(target_pointer_width = "64")]
 const STUDIO_EXE_PATH: &str = "bin/studio64.exe";
 #[cfg(target_pointer_width = "32")]
@@ -171,7 +172,7 @@ fn open_file_with_android_studio(path: impl AsRef<OsStr>, env: &Env) -> Result<(
     let mut application_path = which("studio.cmd").unwrap_or_default();
     if !application_path.is_file() {
         let mut buffer = [0; MAX_PATH as usize];
-        let lstatus = unsafe {
+        unsafe {
             SHRegGetPathW(
                 HKEY_LOCAL_MACHINE,
                 PCWSTR::from_raw(ANDROID_STUDIO_UNINSTALL_KEY_PATH.as_ptr()),
@@ -179,10 +180,9 @@ fn open_file_with_android_studio(path: impl AsRef<OsStr>, env: &Env) -> Result<(
                 &mut buffer,
                 0,
             )
+            .ok()
+            .map_err(|e| OpenFileError::IOError(e.into()))?
         };
-        if lstatus.0 as u32 != ERROR_SUCCESS.0 {
-            return Err(OpenFileError::IOError(core::Error::from_win32().into()));
-        }
         let len = NullTerminatedWTF16Iterator(buffer.as_ptr()).count();
         let uninstaller_path = OsString::from_wide(&buffer[..len]);
         application_path = Path::new(&uninstaller_path)
@@ -190,21 +190,21 @@ fn open_file_with_android_studio(path: impl AsRef<OsStr>, env: &Env) -> Result<(
             .expect("Failed to get Android Studio uninstaller's parent path")
             .join(STUDIO_EXE_PATH);
     }
-    bossy::Command::impure(application_path)
-        .with_arg(
+    duct::cmd(
+        application_path,
+        [
             dunce::canonicalize(Path::new(path.as_ref()))
                 .expect("Failed to canonicalize file path"),
-        )
-        .with_env_vars(env.explicit_env())
-        .run_and_wait()
-        .map_err(OpenFileError::LaunchFailed)?;
+        ],
+    )
+    .vars(env.explicit_env())
+    .run_and_detach()
+    .map_err(OpenFileError::LaunchFailed)?;
     Ok(())
 }
 
-pub fn command_path(name: &str) -> bossy::Result<bossy::Output> {
-    bossy::Command::impure("where.exe")
-        .with_arg(name)
-        .run_and_wait_for_output()
+pub fn command_path(name: &str) -> std::io::Result<std::process::Output> {
+    duct::cmd("where.exe", [name]).run()
 }
 
 struct NativeArgv {
@@ -225,7 +225,7 @@ impl NativeArgv {
 
 impl Drop for NativeArgv {
     fn drop(&mut self) {
-        unsafe { LocalFree(self.argv as _) };
+        let _ = unsafe { LocalFree(HLOCAL(self.argv as _)) };
     }
 }
 
@@ -261,18 +261,8 @@ impl Iterator for NullTerminatedWTF16Iterator {
 // For example, if running `cargo mobile new foo` in C:\Users\MyHome,
 // %~dp0 will expand to C:\Users\MyHome\foo in code.cmd, which is completely broken.
 // Running it through powershell.exe does not have this problem.
-pub fn code_command() -> bossy::Command {
-    bossy::Command::impure_parse("powershell.exe -Command  code")
-}
-
-pub fn gradlew_command(project_dir: impl AsRef<OsStr>) -> bossy::Command {
-    // Path without verbatim prefix.
-    let project_dir = dunce::canonicalize(Path::new(project_dir.as_ref()))
-        .expect("Failed to canonicalize project dir");
-    let gradlew_path = project_dir.join("gradlew.bat");
-    bossy::Command::impure(&gradlew_path)
-        .with_arg("--project-dir")
-        .with_arg(&project_dir)
+pub fn code_command() -> duct::Expression {
+    duct::cmd!("code.cmd")
 }
 
 pub fn replace_path_separator(path: OsString) -> OsString {
